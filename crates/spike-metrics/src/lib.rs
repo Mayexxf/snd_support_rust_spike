@@ -352,6 +352,34 @@ impl Report {
         (ours > 0).then(|| other as f64 / ours as f64)
     }
 
+    /// Split the copy cost into the part partial copying can remove and the
+    /// part it cannot.
+    ///
+    /// Two points are known from a comparison run: the whole frame costs
+    /// `F + V`, and a copy of share `s` costs `F + sV`. Solving gives the fixed
+    /// overhead `F` — the map, the unmap, the wait on the GPU — which no amount
+    /// of copying less will ever remove.
+    ///
+    /// This is the number that decides whether the optimisation is worth
+    /// anything on a given machine. If `F` dominates, copying less buys nothing
+    /// and the effort belongs elsewhere.
+    ///
+    /// `None` when there is no comparison, when the shares are degenerate, or
+    /// when noise puts the arithmetic outside the physically sensible range —
+    /// a negative fixed cost means the run was too noisy to decompose, and
+    /// saying nothing beats reporting a tidy impossibility.
+    pub fn copy_cost_split(&self) -> Option<(f64, f64)> {
+        let full = self.compare.percentile(0.50)? as f64;
+        let partial = self.readback.percentile(0.50)? as f64;
+        let share = self.mean_copied_share();
+        if !(0.0..0.95).contains(&share) || full <= 0.0 {
+            return None;
+        }
+        let variable = (full - partial) / (1.0 - share);
+        let fixed = full - variable;
+        (fixed >= 0.0 && variable >= 0.0).then_some((fixed, variable))
+    }
+
     /// Average bitrate over the whole run, in megabits per second.
     pub fn mbps(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
@@ -564,9 +592,26 @@ impl std::fmt::Display for Report {
                 s,
                 "  оба пути отработали ОДИН И ТОТ ЖЕ кадр, порядок чередуется"
             )?;
+            if let Some((fixed, variable)) = self.copy_cost_split() {
+                writeln!(s, "\n  из стоимости полного копирования:")?;
+                writeln!(
+                    s,
+                    "    {:.1} мс не зависит от площади (map, unmap, ожидание GPU)",
+                    fixed / 1000.0
+                )?;
+                writeln!(
+                    s,
+                    "    {:.1} мс пропорционально площади — только это и экономится",
+                    variable / 1000.0
+                )?;
+            }
             writeln!(
                 s,
-                "  частота кадров в этом режиме занижена — на каждый кадр две копии"
+                "\n  частота кадров в этом режиме занижена — на каждый кадр две копии,"
+            )?;
+            writeln!(
+                s,
+                "  и вторая копия нагружает GPU, так что бюджет здесь пессимистичен"
             )?;
         }
 
@@ -771,6 +816,46 @@ mod tests {
         let text = rep.to_string();
         assert!(text.contains("Сравнение путей копирования"), "{text}");
         assert!(text.contains("быстрее в 5.0 раза"), "{text}");
+    }
+
+    #[test]
+    fn comparison_separates_fixed_cost_from_the_part_that_scales() {
+        // The shape measured on the VM: 43% of the screen copied, whole frame
+        // 7.0 ms, partial 4.5 ms. Linear scaling alone would have predicted
+        // 3.0 ms, so something does not scale — and that residue is the point.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        for _ in 0..MIN_FRAMES_FOR_VERDICT {
+            r.record(&FrameStat {
+                is_new: true,
+                copied_px: 4_345,
+                readback_us: 4_500,
+                compare_us: Some(7_000),
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(10));
+        let (fixed, variable) = rep.copy_cost_split().expect("разложение");
+        assert!((fixed - 2_583.0).abs() < 5.0, "фикс {fixed}");
+        assert!((variable - 4_417.0).abs() < 5.0, "перем {variable}");
+        assert!(rep.to_string().contains("не зависит от площади"));
+    }
+
+    #[test]
+    fn a_noisy_run_is_not_decomposed_into_impossibilities() {
+        // Partial slower than full happens under contention. Solving anyway
+        // yields a negative fixed cost, which is tidy and false.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        for _ in 0..MIN_FRAMES_FOR_VERDICT {
+            r.record(&FrameStat {
+                is_new: true,
+                copied_px: 5_000,
+                readback_us: 9_000,
+                compare_us: Some(7_000),
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(10));
+        assert!(rep.copy_cost_split().is_none());
     }
 
     #[test]

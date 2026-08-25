@@ -524,10 +524,13 @@ impl FrameSource for DdaSource {
             (0, 0, None)
         };
 
-        let work_us = work_start
-            .elapsed()
-            .as_micros()
-            .saturating_sub(u128::from(readback_us)) as u64;
+        // Subtract *both* copies, not just the one that would ship. In a
+        // comparison run the rejected path also ran on this frame, and leaving
+        // it in charged the whole-frame copy to "capture work" — which made the
+        // stage look 70× more expensive than it is and double-counted it in the
+        // frame budget, taking the verdict with it.
+        let copies_us = u128::from(readback_us) + u128::from(compare_us.unwrap_or(0));
+        let work_us = work_start.elapsed().as_micros().saturating_sub(copies_us) as u64;
 
         Ok(Some(Frame {
             width: self.width,
