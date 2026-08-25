@@ -97,6 +97,10 @@ struct Args {
     readback: Readback,
     codec: Codec,
     bitrate_kbps: u32,
+    /// Integer downscale before encoding. The lever that actually matters.
+    scale: u32,
+    cpu_used: i32,
+    threads: u32,
 }
 
 impl Default for Args {
@@ -114,6 +118,9 @@ impl Default for Args {
             readback: Readback::default(),
             codec: Codec::default(),
             bitrate_kbps: 2_000,
+            scale: 1,
+            cpu_used: 8,
+            threads: 2,
         }
     }
 }
@@ -136,6 +143,10 @@ fn usage() -> &'static str {
                                        off     — ничего, замер одного лишь захвата
     --encode <none|vp8|vp9>            кодировать кадры (нужна сборка --features vpx)
     --bitrate <кбит/с>                 целевой битрейт, по умолчанию 2000
+    --scale <1..8>                     уменьшить кадр перед кодированием во
+                                       столько раз (при 2: 1920×1080 → 960×540)
+    --cpu-used <N>                     скорость кодера: больше — быстрее и хуже
+    --threads <N>                      потоков кодера, по умолчанию 2
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -193,6 +204,18 @@ fn parse_args() -> Result<Args, String> {
             }
             "--bitrate" => {
                 args.bitrate_kbps = value()?.parse().map_err(|_| "--bitrate ждёт число")?;
+            }
+            "--scale" => {
+                args.scale = value()?.parse().map_err(|_| "--scale ждёт число")?;
+                if !(1..=8).contains(&args.scale) {
+                    return Err("--scale вне диапазона 1..8".to_owned());
+                }
+            }
+            "--cpu-used" => {
+                args.cpu_used = value()?.parse().map_err(|_| "--cpu-used ждёт число")?;
+            }
+            "--threads" => {
+                args.threads = value()?.parse().map_err(|_| "--threads ждёт число")?;
             }
             other => return Err(format!("неизвестный ключ: {other}")),
         }
@@ -271,6 +294,8 @@ fn build_encoder(
     }
     let mut settings = Settings::new(width, height, args.fps);
     settings.bitrate_kbps = args.bitrate_kbps;
+    settings.cpu_used = args.cpu_used;
+    settings.threads = args.threads;
     VpxEncoder::new(args.codec, settings).map(Some)
 }
 
@@ -353,7 +378,13 @@ fn main() {
     }
     println!();
 
-    let mut encoder = match build_encoder(&args, w, h) {
+    // The YUV frame persists between frames for the same reason the BGRA buffer
+    // does: conversion only touches what changed, so everything else has to
+    // still hold the previous frame. It also fixes the encoded resolution.
+    let mut yuv = I420::new(w, h, args.scale);
+    let (ew, eh) = (yuv.width, yuv.height);
+
+    let mut encoder = match build_encoder(&args, ew, eh) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("\nОшибка: {e}");
@@ -366,16 +397,24 @@ fn main() {
             std::process::exit(2);
         }
         println!(
-            "Кодирование: {} при {} кбит/с.",
+            "Кодирование: {} в {ew}×{eh} при {} кбит/с, cpu-used {}, потоков {}.",
             args.codec.name(),
-            args.bitrate_kbps
+            args.bitrate_kbps,
+            args.cpu_used,
+            args.threads
+        );
+    }
+    // Outside the codec branch: --scale changes the conversion cost too, and a
+    // run that quietly measured a different resolution than the operator thinks
+    // is a run whose numbers mean something else.
+    if args.scale > 1 {
+        println!(
+            "Кадр уменьшен в {} раза: {ew}×{eh}, то есть {:.0}% пикселей.",
+            args.scale,
+            100.0 / (args.scale * args.scale) as f64
         );
     }
 
-    // The YUV frame persists between frames for the same reason the BGRA buffer
-    // does: conversion only touches what changed, so everything else has to
-    // still hold the previous frame.
-    let mut yuv = I420::new(w, h);
     let mut first_frame = true;
 
     let mut rec = Recorder::new(format!("Захват · {}", source.describe()), w, h, args.fps);
