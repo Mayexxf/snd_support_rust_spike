@@ -10,13 +10,11 @@ publish.workspace = true
 [dependencies]
 spike-capture.workspace = true
 
-# Off by default on purpose. libvpx needs vcpkg, nasm and LLVM on the build
-# machine, and none of that should stand between someone and a capture
-# measurement. Enable with --features vpx.
-[dependencies.env-libvpx-sys]
-version = "5.1"
-features = ["generate"]
-optional = true
-
 [features]
-vpx = ["dep:env-libvpx-sys"]
+# Off by default on purpose: capture is measurable without an encoder, and
+# nothing about libvpx should stand between someone and a capture measurement.
+#
+# No dependency here. The declarations are written out in src/vpx/ffi.rs and the
+# build script points the linker at the library, so enabling this needs a
+# libvpx.lib and nothing else — no vcpkg, no bindgen, no LLVM.
+vpx = []

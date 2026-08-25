@@ -1,84 +1,53 @@
-//! Check the libvpx setup before the compiler has to.
+//! Point the linker at libvpx.
 //!
-//! bindgen fails quietly. When clang cannot find the libvpx headers it does not
-//! stop — it emits incomplete types, and `vpx_codec_enc_cfg` arrives with a
-//! single `_address` field. The build then dies in fifteen "no field `g_w` on
-//! type" errors that say nothing about the actual cause, which is an include
-//! path.
+//! Replaces env-libvpx-sys, which needed bindgen, which needed LLVM, which
+//! needed a Visual Studio environment for clang to find `stdint.h`. All that
+//! was in service of generating declarations for nine functions — which are now
+//! written out in src/vpx/ffi.rs instead.
 //!
-//! This runs after env-libvpx-sys has already produced its bindings, so it
-//! cannot prevent that. What it can do is put one sentence naming the real
-//! problem directly above the wall of errors.
+//! What is left is two lines of linker configuration and a check that the
+//! library is actually where it was said to be.
 
 use std::path::Path;
 
 fn main() {
-    for var in ["VPX_LIB_DIR", "VPX_INCLUDE_DIR", "VPX_VERSION", "LIBCLANG_PATH"] {
+    for var in ["VPX_LIB_DIR", "VPX_STATIC"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
-    // Nothing to check when the encoder is not being built.
+    // Nothing to link when the encoder is not being built.
     if std::env::var_os("CARGO_FEATURE_VPX").is_none() {
         return;
     }
 
-    let mut problems = Vec::new();
-
-    match std::env::var_os("VPX_INCLUDE_DIR") {
-        None => problems.push(
-            "VPX_INCLUDE_DIR не задана. Без неё bindgen запускается без путей \
-             поиска, не находит vpx/vpx_encoder.h и молча выдаёт пустые типы"
-                .to_owned(),
-        ),
-        Some(dir) => {
-            let header = Path::new(&dir).join("vpx").join("vpx_encoder.h");
-            if !header.exists() {
-                problems.push(format!(
-                    "не найден {}. VPX_INCLUDE_DIR должна указывать на каталог, \
-                     ВНУТРИ которого лежит подкаталог vpx/",
-                    header.display()
-                ));
-            }
-        }
-    }
-
-    match std::env::var_os("VPX_LIB_DIR") {
-        None => problems.push("VPX_LIB_DIR не задана".to_owned()),
-        Some(dir) => {
-            let dir = Path::new(&dir);
-            // env-libvpx-sys links `static=libvpx` on Windows, so this exact
-            // name is what matters — not the import library `vpx.lib` that sits
-            // next to it in the prebuilt archives.
-            let names = ["libvpx.lib", "libvpx.a", "vpx.lib"];
-            if !names.iter().any(|n| dir.join(n).exists()) {
-                problems.push(format!(
-                    "в {} нет ни одного из {names:?}",
-                    dir.display()
-                ));
-            }
-        }
-    }
-
-    if std::env::var_os("VPX_VERSION").is_none() {
-        problems.push(
-            "VPX_VERSION не задана. Она уходит в проверку ABI при инициализации \
-             кодера, и должна совпадать с установленной libvpx"
-                .to_owned(),
+    let Some(lib_dir) = std::env::var_os("VPX_LIB_DIR") else {
+        panic!(
+            "\n\nVPX_LIB_DIR не задана — не сказано, где искать libvpx.\n\
+             См. раздел «Кодирование: libvpx» в README.\n"
         );
-    }
+    };
+    let dir = Path::new(&lib_dir);
 
-    if problems.is_empty() {
-        return;
-    }
+    // Prebuilt Windows SDKs ship the static library as libvpx.lib and an import
+    // library for the DLL as vpx.lib beside it. The static one is what we want,
+    // so it is looked for first.
+    let candidates: [(&str, &str); 3] =
+        [("libvpx.lib", "libvpx"), ("libvpx.a", "vpx"), ("vpx.lib", "vpx")];
+    let Some((file, link_name)) = candidates.iter().find(|(f, _)| dir.join(f).exists()) else {
+        panic!(
+            "\n\nВ {} нет libvpx: искали libvpx.lib, libvpx.a, vpx.lib.\n\
+             VPX_LIB_DIR должна указывать на каталог с самой библиотекой —\n\
+             в готовых сборках это lib\\x64, а не корень архива.\n",
+            dir.display()
+        );
+    };
 
-    eprintln!("\n=== libvpx настроена неправильно ===");
-    for p in &problems {
-        eprintln!("  · {p}");
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    let dynamic = std::env::var_os("VPX_DYNAMIC").is_some();
+    if dynamic {
+        println!("cargo:rustc-link-lib={link_name}");
+    } else {
+        println!("cargo:rustc-link-lib=static={link_name}");
     }
-    eprintln!(
-        "\nЕсли пути верны, а типы всё равно пустые — clang не нашёл системные \n\
-         заголовки Windows. Соберите из Developer PowerShell for VS 2022.\n\
-         Подробно — раздел «Кодирование: libvpx» в README.\n"
-    );
-    panic!("libvpx настроена неправильно, см. выше");
+    eprintln!("libvpx: {} из {}", file, dir.display());
 }
