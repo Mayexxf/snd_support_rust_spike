@@ -160,6 +160,8 @@ pub struct Recorder {
     access_lost: u32,
     reinits: u32,
     cpu_start: cpu::CpuSnapshot,
+    tracks: Vec<Track>,
+    comparing: bool,
 }
 
 impl Recorder {
@@ -189,6 +191,25 @@ impl Recorder {
             access_lost: 0,
             reinits: 0,
             cpu_start: cpu::CpuSnapshot::now(),
+            tracks: Vec::new(),
+            comparing: false,
+        }
+    }
+
+    /// Add one encoder configuration to a comparison run.
+    ///
+    /// Adding any track switches the recorder into comparison mode: the shared
+    /// per-frame budget stops being meaningful, because the loop is now running
+    /// several encoders over every frame, and each track carries its own.
+    pub fn add_track(&mut self, label: impl Into<String>, width: u32, height: u32) -> usize {
+        self.comparing = true;
+        self.tracks.push(Track::new(label, width, height));
+        self.tracks.len() - 1
+    }
+
+    pub fn record_track(&mut self, index: usize, stat: &TrackStat) {
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.record(stat);
         }
     }
 
@@ -213,12 +234,14 @@ impl Recorder {
         // figure that decides whether the target keeps up, so it is accumulated
         // per frame rather than reconstructed from three separate percentiles —
         // the p95 of a sum is not the sum of the p95s.
-        self.budget.push(
-            stat.work_us
-                + stat.readback_us
-                + stat.convert_us
-                + stat.encode_us.unwrap_or(0),
-        );
+        if !self.comparing {
+            self.budget.push(
+                stat.work_us
+                    + stat.readback_us
+                    + stat.convert_us
+                    + stat.encode_us.unwrap_or(0),
+            );
+        }
         self.changed_px_total += stat.changed_px as u128;
         self.copied_px_total += stat.copied_px as u128;
         self.dirty_rects_total += stat.dirty_rects as u64;
@@ -278,6 +301,7 @@ impl Recorder {
             access_lost: self.access_lost,
             reinits: self.reinits,
             cpu,
+            tracks: self.tracks,
         }
     }
 }
@@ -310,6 +334,9 @@ pub struct Report {
     pub access_lost: u32,
     pub reinits: u32,
     pub cpu: cpu::CpuUsage,
+    /// Encoder configurations measured side by side on identical frames.
+    /// Empty outside a comparison run.
+    pub tracks: Vec<Track>,
 }
 
 impl Report {
@@ -404,6 +431,20 @@ impl Report {
         (self.encoded_bytes_total as f64 * 8.0) / secs / 1_000_000.0
     }
 
+    /// Cheapest and dearest configuration by median encode time.
+    ///
+    /// `None` when there is nothing to compare — fewer than two tracks, or no
+    /// samples yet.
+    pub fn encode_spread(&self) -> Option<(&Track, &Track)> {
+        if self.tracks.len() < 2 {
+            return None;
+        }
+        let key = |t: &&Track| t.encode.percentile(0.50);
+        let cheap = self.tracks.iter().filter(|t| key(t).is_some()).min_by_key(key)?;
+        let dear = self.tracks.iter().filter(|t| key(t).is_some()).max_by_key(key)?;
+        Some((cheap, dear))
+    }
+
     fn mean_bytes(total: u128, count: u64) -> Option<u128> {
         (count > 0).then(|| total / count as u128)
     }
@@ -439,16 +480,7 @@ impl Report {
         if self.budget.len() < MIN_FRAMES_FOR_VERDICT {
             return None;
         }
-        let share = self.budget_share(0.95)?;
-        Some(if share < 0.5 {
-            Verdict::Comfortable(share)
-        } else if share < 0.8 {
-            Verdict::Tight(share)
-        } else if share < 1.0 {
-            Verdict::Marginal(share)
-        } else {
-            Verdict::Fails(share)
-        })
+        self.budget_share(0.95).map(Verdict::classify)
     }
 }
 
@@ -474,6 +506,33 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// Classify a p95 share of the frame interval.
+    ///
+    /// One place for the thresholds, so the per-track table of a comparison run
+    /// and the verdict of a single run cannot quietly disagree about what
+    /// "keeps up" means.
+    pub fn classify(share: f64) -> Self {
+        if share < 0.5 {
+            Verdict::Comfortable(share)
+        } else if share < 0.8 {
+            Verdict::Tight(share)
+        } else if share < 1.0 {
+            Verdict::Marginal(share)
+        } else {
+            Verdict::Fails(share)
+        }
+    }
+
+    /// One-character marker for a table row.
+    pub fn mark(&self) -> &'static str {
+        match self {
+            Verdict::Comfortable(_) => "✓",
+            Verdict::Tight(_) => "·",
+            Verdict::Marginal(_) => "⚠",
+            Verdict::Fails(_) => "✗",
+        }
+    }
+
     pub fn share(&self) -> f64 {
         match *self {
             Verdict::Comfortable(s) | Verdict::Tight(s) | Verdict::Marginal(s) | Verdict::Fails(s) => s,
@@ -495,6 +554,142 @@ impl Verdict {
                 "НЕ УСПЕВАЕТ. Целевая частота недостижима в этой конфигурации"
             }
         }
+    }
+}
+
+/// Russian plural for a count: 1 кодер, 2 кодера, 5 кодеров.
+///
+/// The report is read by whoever is on duty, not by a compiler. «5 кодера» in
+/// the middle of a paragraph is the kind of thing that makes a reader distrust
+/// the numbers around it.
+pub fn plural(n: u64, one: &str, few: &str, many: &str) -> String {
+    let (last, last_two) = (n % 10, n % 100);
+    let word = if last == 1 && last_two != 11 {
+        one
+    } else if (2..=4).contains(&last) && !(12..=14).contains(&last_two) {
+        few
+    } else {
+        many
+    };
+    format!("{n} {word}")
+}
+
+/// One frame's cost for one configuration in a comparison run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackStat {
+    /// Capture and copy. Paid once per frame and identical for every track,
+    /// which is exactly why it is passed in rather than measured per track.
+    pub shared_us: u64,
+    /// Conversion into this track's resolution.
+    pub convert_us: u64,
+    pub encode_us: u64,
+    pub bytes: usize,
+    pub keyframe: bool,
+}
+
+/// One encoder configuration inside a comparison run.
+///
+/// Every track is handed the same captured frames, in the same order, within the
+/// same run. That is the entire point. Four separate runs of the sweep differed
+/// in how much of the screen the operator happened to move — between 23% and
+/// 35% — and the apparent effect of doubling the encoder's threads turned out to
+/// be that difference and nothing else: the ratio of the medians matched the
+/// ratio of the changed areas to two decimal places.
+///
+/// With the content held fixed the medians below can be read against each other
+/// directly. No normalising by changed area, no arithmetic by hand, no chance of
+/// crediting the codec for what the operator's scrolling did.
+#[derive(Debug)]
+pub struct Track {
+    /// The configuration as the operator typed it, e.g. `vp9:s2:t4`.
+    pub label: String,
+    /// Resolution handed to this encoder, after downscaling.
+    pub width: u32,
+    pub height: u32,
+    /// Conversion into this track's resolution.
+    ///
+    /// Charged to the track, because a track running alone would pay it. Tracks
+    /// asking for the same scale share one conversion in wall-clock time — it is
+    /// timed once and charged to each of them, which is what each would cost
+    /// alone rather than what they cost together.
+    pub convert: Latencies,
+    pub encode: Latencies,
+    /// Capture, copy, conversion and encoding: what this configuration would
+    /// cost per frame if it were the only one running.
+    pub budget: Latencies,
+    pub frames: u64,
+    pub bytes_total: u128,
+    pub keyframes: u64,
+    pub keyframe_bytes_total: u128,
+    pub delta_frames: u64,
+    pub delta_bytes_total: u128,
+}
+
+impl Track {
+    pub fn new(label: impl Into<String>, width: u32, height: u32) -> Self {
+        Self {
+            label: label.into(),
+            width,
+            height,
+            convert: Latencies::default(),
+            encode: Latencies::default(),
+            budget: Latencies::default(),
+            frames: 0,
+            bytes_total: 0,
+            keyframes: 0,
+            keyframe_bytes_total: 0,
+            delta_frames: 0,
+            delta_bytes_total: 0,
+        }
+    }
+
+    pub fn record(&mut self, stat: &TrackStat) {
+        self.frames += 1;
+        self.convert.push(stat.convert_us);
+        self.encode.push(stat.encode_us);
+        self.budget
+            .push(stat.shared_us + stat.convert_us + stat.encode_us);
+        self.bytes_total += stat.bytes as u128;
+        if stat.keyframe {
+            self.keyframes += 1;
+            self.keyframe_bytes_total += stat.bytes as u128;
+        } else {
+            self.delta_frames += 1;
+            self.delta_bytes_total += stat.bytes as u128;
+        }
+    }
+
+    pub fn budget_share(&self, q: f64, interval_us: u64) -> Option<f64> {
+        if interval_us == 0 {
+            return None;
+        }
+        self.budget
+            .percentile(q)
+            .map(|us| us as f64 / interval_us as f64)
+    }
+
+    /// Verdict for this configuration alone, on the same thresholds as a single
+    /// run. `None` until there are enough frames for a percentile to mean
+    /// anything.
+    pub fn verdict(&self, interval_us: u64) -> Option<Verdict> {
+        if self.budget.len() < MIN_FRAMES_FOR_VERDICT {
+            return None;
+        }
+        self.budget_share(0.95, interval_us).map(Verdict::classify)
+    }
+
+    /// Mean size of a delta frame, in bytes.
+    ///
+    /// The comparable size figure in this mode. Bitrate is not: running several
+    /// encoders over every frame drives the capture rate down, so every track's
+    /// bytes-per-second is depressed by however many tracks are in the run.
+    /// Bytes per frame does not care.
+    pub fn mean_delta_bytes(&self) -> Option<u128> {
+        Report::mean_bytes(self.delta_bytes_total, self.delta_frames)
+    }
+
+    pub fn mean_keyframe_bytes(&self) -> Option<u128> {
+        Report::mean_bytes(self.keyframe_bytes_total, self.keyframes)
     }
 }
 
@@ -560,7 +755,9 @@ impl std::fmt::Display for Report {
         if !self.encode.is_empty() {
             writeln!(s, "  кодирование          {}", self.encode.summary_ms())?;
         }
-        writeln!(s, "  ИТОГО на кадр        {}", self.budget.summary_ms())?;
+        if !self.budget.is_empty() {
+            writeln!(s, "  ИТОГО на кадр        {}", self.budget.summary_ms())?;
+        }
         writeln!(s, "\n  ожидание кадра       {}", self.wait.summary_ms())?;
         writeln!(s, "  (ожидание — не расход: при цели {} к/с так и должно быть)", self.target_fps)?;
 
@@ -571,13 +768,7 @@ impl std::fmt::Display for Report {
             if let (Some(p50), Some(p95)) = (self.budget_share(0.50), self.budget_share(0.95)) {
                 writeln!(s, "  занято p50 / p95        {:.0}% / {:.0}%", p50 * 100.0, p95 * 100.0)?;
             }
-            let mark = match v {
-                Verdict::Comfortable(_) => "✓",
-                Verdict::Tight(_) => "·",
-                Verdict::Marginal(_) => "⚠",
-                Verdict::Fails(_) => "✗",
-            };
-            writeln!(s, "  {mark} {}", v.explain())?;
+            writeln!(s, "  {} {}", v.mark(), v.explain())?;
         } else if !self.budget.is_empty() {
             writeln!(s, "\n-- Бюджет кадра --")?;
             writeln!(
@@ -631,6 +822,106 @@ impl std::fmt::Display for Report {
                 s,
                 "  и вторая копия нагружает GPU, так что бюджет здесь пессимистичен"
             )?;
+        }
+
+        if !self.tracks.is_empty() {
+            let interval = self.interval_us();
+            let w = self
+                .tracks
+                .iter()
+                .map(|t| t.label.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("конфигурация".chars().count());
+
+            writeln!(s, "\n-- Сравнение на одних и тех же кадрах --")?;
+            writeln!(
+                s,
+                "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}",
+                "конфигурация", "размер", "конверт.", "кодирование p50/p95", "бюджет p95", "разн.кадр"
+            )?;
+            for t in &self.tracks {
+                let size = format!("{}×{}", t.width, t.height);
+                let enc = match (t.encode.percentile(0.50), t.encode.percentile(0.95)) {
+                    (Some(a), Some(b)) => {
+                        format!("{:.1} / {:.1} мс", a as f64 / 1000.0, b as f64 / 1000.0)
+                    }
+                    _ => "—".to_owned(),
+                };
+                let bud = match (t.budget_share(0.95, interval), t.verdict(interval)) {
+                    (Some(share), Some(v)) => format!("{:.0}% {}", share * 100.0, v.mark()),
+                    // Enough samples to divide, not enough for the division to
+                    // mean anything. Saying so beats a confident tick.
+                    (Some(share), None) => format!("{:.0}% ?", share * 100.0),
+                    _ => "—".to_owned(),
+                };
+                let bytes = match t.mean_delta_bytes() {
+                    Some(b) => format!("{b} Б"),
+                    None => "—".to_owned(),
+                };
+                let conv = match t.convert.percentile(0.50) {
+                    Some(us) => format!("{:.1} мс", us as f64 / 1000.0),
+                    None => "—".to_owned(),
+                };
+                writeln!(
+                    s,
+                    "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}",
+                    t.label, size, conv, enc, bud, bytes
+                )?;
+            }
+
+            if let Some((cheap, dear)) = self.encode_spread() {
+                let (lo, hi) = (
+                    cheap.encode.percentile(0.50).unwrap_or(0) as f64 / 1000.0,
+                    dear.encode.percentile(0.50).unwrap_or(0) as f64 / 1000.0,
+                );
+                if lo > 0.0 {
+                    writeln!(
+                        s,
+                        "\n  разброс по кодированию: {:.1} мс ({}) … {:.1} мс ({}), то есть {:.2}×",
+                        lo,
+                        cheap.label,
+                        hi,
+                        dear.label,
+                        hi / lo
+                    )?;
+                }
+            }
+
+            let frames = self.tracks.first().map_or(0, |t| t.frames);
+            writeln!(
+                s,
+                "\n  Все конфигурации получили ОДНИ И ТЕ ЖЕ {}, порядок кодирования",
+                plural(frames, "кадр", "кадра", "кадров")
+            )?;
+            writeln!(
+                s,
+                "  чередуется по кадрам. Содержимое больше не переменная: медианы"
+            )?;
+            writeln!(
+                s,
+                "  сравнимы напрямую, нормировать по изменившейся площади не нужно."
+            )?;
+            writeln!(
+                s,
+                "\n  Битрейт здесь не приводится: {} на каждый кадр занижают частоту,",
+                plural(self.tracks.len() as u64, "кодер", "кодера", "кодеров")
+            )?;
+            writeln!(
+                s,
+                "  и байты в секунду просели бы у всех дорожек одинаково неверно."
+            )?;
+            writeln!(
+                s,
+                "  «Бюджет» — во что обошлась бы эта конфигурация, будь она одна."
+            )?;
+            if frames < MIN_FRAMES_FOR_VERDICT as u64 {
+                writeln!(
+                    s,
+                    "\n  ⚠ Кадров с содержимым {frames}, для вердикта нужно {MIN_FRAMES_FOR_VERDICT}."
+                )?;
+                writeln!(s, "  Столбец «бюджет» описывает один неудачный кадр, а не машину.")?;
+            }
         }
 
         if self.encoded_bytes_total > 0 {
@@ -692,6 +983,154 @@ mod tests {
         // A q above 1.0 must clamp rather than panic: it can only arrive from a
         // typo in a caller, and panicking would throw away a finished run.
         assert_eq!(l.percentile(2.0), Some(7));
+    }
+
+    /// Feed one frame to a comparison recorder. Shared costs are identical for
+    /// every track by construction — that is the point of the mode.
+    fn compare_frame(r: &mut Recorder, tracks: &[(usize, u64, u64, usize)]) {
+        r.record(&FrameStat {
+            wait_us: 1_000,
+            work_us: 100,
+            readback_us: 900,
+            is_new: true,
+            changed_px: 5_000,
+            ..Default::default()
+        });
+        for &(index, convert_us, encode_us, bytes) in tracks {
+            r.record_track(
+                index,
+                &TrackStat {
+                    shared_us: 1_000,
+                    convert_us,
+                    encode_us,
+                    bytes,
+                    keyframe: false,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn russian_counts_agree_with_their_nouns() {
+        assert_eq!(plural(1, "кадр", "кадра", "кадров"), "1 кадр");
+        assert_eq!(plural(2, "кадр", "кадра", "кадров"), "2 кадра");
+        assert_eq!(plural(5, "кадр", "кадра", "кадров"), "5 кадров");
+        // The teens are the trap: 11 takes the same form as 5, not as 1.
+        assert_eq!(plural(11, "кадр", "кадра", "кадров"), "11 кадров");
+        assert_eq!(plural(12, "кадр", "кадра", "кадров"), "12 кадров");
+        assert_eq!(plural(14, "кадр", "кадра", "кадров"), "14 кадров");
+        assert_eq!(plural(21, "кадр", "кадра", "кадров"), "21 кадр");
+        assert_eq!(plural(102, "кадр", "кадра", "кадров"), "102 кадра");
+        assert_eq!(plural(111, "кадр", "кадра", "кадров"), "111 кадров");
+        assert_eq!(plural(0, "кадр", "кадра", "кадров"), "0 кадров");
+    }
+
+    #[test]
+    fn verdict_thresholds_live_in_one_place() {
+        assert!(matches!(Verdict::classify(0.49), Verdict::Comfortable(_)));
+        assert!(matches!(Verdict::classify(0.50), Verdict::Tight(_)));
+        assert!(matches!(Verdict::classify(0.79), Verdict::Tight(_)));
+        assert!(matches!(Verdict::classify(0.80), Verdict::Marginal(_)));
+        assert!(matches!(Verdict::classify(0.99), Verdict::Marginal(_)));
+        assert!(matches!(Verdict::classify(1.00), Verdict::Fails(_)));
+    }
+
+    #[test]
+    fn each_track_carries_its_own_budget() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let big = r.add_track("vp9:s1", 100, 100);
+        let small = r.add_track("vp9:s2", 50, 50);
+        for _ in 0..40 {
+            compare_frame(&mut r, &[(big, 6_000, 40_000, 8_000), (small, 3_000, 10_000, 5_000)]);
+        }
+        let rep = r.finish(Duration::from_secs(1));
+
+        // The shared budget is not collected in this mode, and must not be: with
+        // several encoders per frame there is no single number it could mean.
+        assert!(rep.budget.is_empty());
+        assert!(rep.verdict().is_none());
+
+        assert_eq!(rep.tracks.len(), 2);
+        assert_eq!(rep.tracks[big].budget.percentile(0.50), Some(47_000));
+        assert_eq!(rep.tracks[small].budget.percentile(0.50), Some(14_000));
+
+        let interval = rep.interval_us();
+        assert!(matches!(rep.tracks[big].verdict(interval), Some(Verdict::Fails(_))));
+        assert!(matches!(rep.tracks[small].verdict(interval), Some(Verdict::Comfortable(_))));
+    }
+
+    #[test]
+    fn spread_names_the_cheapest_and_the_dearest() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s1", 100, 100);
+        let b = r.add_track("vp9:s2", 50, 50);
+        let c = r.add_track("vp8:s2", 50, 50);
+        for _ in 0..40 {
+            compare_frame(
+                &mut r,
+                &[(a, 6_000, 40_000, 8_000), (b, 3_000, 10_000, 5_000), (c, 3_000, 12_000, 6_000)],
+            );
+        }
+        let rep = r.finish(Duration::from_secs(1));
+        let (cheap, dear) = rep.encode_spread().expect("три дорожки есть");
+        assert_eq!(cheap.label, "vp9:s2");
+        assert_eq!(dear.label, "vp9:s1");
+    }
+
+    #[test]
+    fn one_track_alone_has_nothing_to_compare() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9", 100, 100);
+        compare_frame(&mut r, &[(a, 1_000, 2_000, 100)]);
+        let rep = r.finish(Duration::from_secs(1));
+        assert!(rep.encode_spread().is_none());
+    }
+
+    #[test]
+    fn a_thin_comparison_says_so_instead_of_judging() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s2", 50, 50);
+        // Five frames: nearest-rank p95 over five samples is just the worst one.
+        for _ in 0..5 {
+            compare_frame(&mut r, &[(a, 3_000, 10_000, 5_000)]);
+        }
+        let rep = r.finish(Duration::from_secs(1));
+        assert!(rep.tracks[a].verdict(rep.interval_us()).is_none());
+        let text = rep.to_string();
+        assert!(text.contains("для вердикта нужно 30"), "{text}");
+        // A question mark, not a tick: the share is computable, the judgement is
+        // not.
+        assert!(text.contains("% ?"), "{text}");
+    }
+
+    #[test]
+    fn comparison_table_lists_every_configuration() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s1", 100, 100);
+        let b = r.add_track("vp8:s2:t4", 50, 50);
+        for _ in 0..40 {
+            compare_frame(&mut r, &[(a, 6_000, 40_000, 8_000), (b, 3_000, 10_000, 5_000)]);
+        }
+        let text = r.finish(Duration::from_secs(1)).to_string();
+        assert!(text.contains("vp9:s1"), "{text}");
+        assert!(text.contains("vp8:s2:t4"), "{text}");
+        assert!(text.contains("100×100"), "{text}");
+        assert!(text.contains("50×50"), "{text}");
+        // Bitrate would be depressed by the number of encoders per frame, so it
+        // is deliberately absent here.
+        assert!(!text.contains("средний битрейт"), "{text}");
+    }
+
+    #[test]
+    fn keyframes_do_not_contaminate_the_delta_size() {
+        let mut track = Track::new("vp9", 64, 64);
+        track.record(&TrackStat { encode_us: 1, bytes: 60_000, keyframe: true, ..Default::default() });
+        for _ in 0..3 {
+            track.record(&TrackStat { encode_us: 1, bytes: 1_000, keyframe: false, ..Default::default() });
+        }
+        assert_eq!(track.mean_delta_bytes(), Some(1_000));
+        assert_eq!(track.mean_keyframe_bytes(), Some(60_000));
+        assert_eq!(track.frames, 4);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, synthetic};
 use spike_encode::{Codec, convert::I420};
-use spike_metrics::{FrameStat, Recorder, env::Machine};
+use spike_metrics::{FrameStat, Recorder, TrackStat, env::Machine};
 
 const DEFAULT_SECONDS: u64 = 30;
 const DEFAULT_FPS: u32 = 30;
@@ -101,6 +101,9 @@ struct Args {
     scale: u32,
     cpu_used: i32,
     threads: u32,
+    /// Encoder configurations to measure side by side on identical frames.
+    /// Empty for an ordinary single-encoder run.
+    compare: Vec<String>,
 }
 
 impl Default for Args {
@@ -121,7 +124,101 @@ impl Default for Args {
             scale: 1,
             cpu_used: 8,
             threads: 2,
+            compare: Vec::new(),
         }
+    }
+}
+
+/// One encoder configuration in a comparison run.
+///
+/// Written as `vp9:s2:t4:c9:b1500` — the codec first, then any of scale,
+/// threads, cpu-used and bitrate in any order. Anything left out falls back to
+/// the run-wide `--scale`, `--threads`, `--cpu-used`, `--bitrate`, so the common
+/// case stays short: `--compare vp9,vp8` compares two codecs at the same
+/// settings.
+#[derive(Debug, Clone)]
+struct Spec {
+    label: String,
+    codec: Codec,
+    scale: u32,
+    threads: u32,
+    cpu_used: i32,
+    bitrate_kbps: u32,
+}
+
+impl Spec {
+    fn parse(text: &str, args: &Args) -> Result<Self, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("пустая конфигурация в --compare".to_owned());
+        }
+        let mut parts = text.split(':');
+        let codec_text = parts.next().unwrap_or_default();
+        let codec = Codec::parse(codec_text)
+            .ok_or(format!("неизвестный кодек «{codec_text}» в «{text}»"))?;
+        if codec == Codec::None {
+            return Err(format!("«{text}»: сравнивать нечего, none — это не кодек"));
+        }
+
+        let mut spec = Spec {
+            label: text.to_owned(),
+            codec,
+            scale: args.scale,
+            threads: args.threads,
+            cpu_used: args.cpu_used,
+            bitrate_kbps: args.bitrate_kbps,
+        };
+
+        for part in parts {
+            // Split by character rather than by byte: a typo with a Cyrillic
+            // letter would otherwise land mid-codepoint and panic instead of
+            // producing the error message the operator needs.
+            let mut chars = part.chars();
+            let tag = chars.next().ok_or(format!("пустая часть в «{text}»"))?;
+            let value = chars.as_str();
+            let number = |what: &str| -> Result<i64, String> {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| format!("«{text}»: {what} ждёт число, а не «{value}»"))
+            };
+            match tag {
+                's' => {
+                    let n = number("масштаб s")?;
+                    if !(1..=8).contains(&n) {
+                        return Err(format!("«{text}»: масштаб вне диапазона 1..8"));
+                    }
+                    spec.scale = n as u32;
+                }
+                't' => {
+                    let n = number("потоки t")?;
+                    if !(1..=64).contains(&n) {
+                        return Err(format!("«{text}»: потоков вне диапазона 1..64"));
+                    }
+                    spec.threads = n as u32;
+                }
+                'c' => {
+                    let n = number("cpu-used c")?;
+                    if !(-16..=16).contains(&n) {
+                        return Err(format!("«{text}»: cpu-used вне диапазона -16..16"));
+                    }
+                    spec.cpu_used = n as i32;
+                }
+                'b' => {
+                    let n = number("битрейт b")?;
+                    if !(1..=100_000).contains(&n) {
+                        return Err(format!("«{text}»: битрейт вне диапазона 1..100000"));
+                    }
+                    spec.bitrate_kbps = n as u32;
+                }
+                other => {
+                    return Err(format!(
+                        "«{text}»: непонятная часть «{part}». Ожидались s (масштаб), \
+                         t (потоки), c (cpu-used), b (битрейт), а не «{other}»"
+                    ));
+                }
+            }
+        }
+        Ok(spec)
     }
 }
 
@@ -147,6 +244,12 @@ fn usage() -> &'static str {
                                        столько раз (при 2: 1920×1080 → 960×540)
     --cpu-used <N>                     скорость кодера: больше — быстрее и хуже
     --threads <N>                      потоков кодера, по умолчанию 2
+    --compare <конф,конф,...>          мерить несколько конфигураций кодера на
+                                       ОДНИХ И ТЕХ ЖЕ кадрах, в одном прогоне.
+                                       Конфигурация: кодек[:sМасштаб][:tПотоки]
+                                       [:cCpuUsed][:bБитрейт], опущенное берётся
+                                       из ключей выше. Пример:
+                                         --compare vp9:s2:t2,vp9:s2:t4,vp8:s2
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -158,6 +261,12 @@ fn usage() -> &'static str {
 Сравнение путей копирования — ОДИН прогон, оба пути на каждом кадре:
 
     spike --readback compare --seconds 30
+
+Сравнение настроек кодера — тоже ОДИН прогон. Отдельные прогоны сравнивать
+нельзя: содержимое экрана меняется между ними и объясняет разницу целиком.
+
+    spike --compare vp9:s2:t2,vp9:s2:t4,vp8:s2 --seconds 60
+    spike --compare vp9:s1,vp9:s2,vp9:s3,vp9:s4 --seconds 60
 "
 }
 
@@ -216,6 +325,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--threads" => {
                 args.threads = value()?.parse().map_err(|_| "--threads ждёт число")?;
+            }
+            "--compare" => {
+                args.compare =
+                    value()?.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+                if args.compare.is_empty() {
+                    return Err("--compare без конфигураций".to_owned());
+                }
             }
             other => return Err(format!("неизвестный ключ: {other}")),
         }
@@ -311,6 +427,45 @@ fn build_encoder(args: &Args, _width: u32, _height: u32) -> Result<Option<Never>
     ))
 }
 
+/// Build one encoder per configuration under comparison.
+///
+/// All of them are built before the run starts: a configuration libvpx refuses
+/// should cost nothing but an error message, not sixty seconds of scrolling
+/// followed by one.
+#[cfg(feature = "vpx")]
+fn build_compare_encoders(
+    specs: &[Spec],
+    planes: &[I420],
+    plane_of: &[usize],
+    fps: u32,
+) -> Result<Vec<spike_encode::vpx::VpxEncoder>, String> {
+    use spike_encode::vpx::{Settings, VpxEncoder};
+    specs
+        .iter()
+        .zip(plane_of)
+        .map(|(spec, &pi)| {
+            let plane = &planes[pi];
+            let mut settings = Settings::new(plane.width, plane.height, fps);
+            settings.bitrate_kbps = spec.bitrate_kbps;
+            settings.cpu_used = spec.cpu_used;
+            settings.threads = spec.threads;
+            VpxEncoder::new(spec.codec, settings).map_err(|e| format!("«{}»: {e}", spec.label))
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "vpx"))]
+fn build_compare_encoders(
+    _specs: &[Spec],
+    _planes: &[I420],
+    _plane_of: &[usize],
+    _fps: u32,
+) -> Result<Vec<Never>, String> {
+    Err("стенд собран без libvpx, сравнивать кодеры нечем.\n\
+         Пересоберите с --features vpx (см. README)"
+        .to_owned())
+}
+
 /// Stand-in for the encoder type when the feature is off, so the call sites
 /// stay identical instead of sprouting cfg blocks.
 #[cfg(not(feature = "vpx"))]
@@ -338,6 +493,28 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Parsed before anything is opened: a typo in --compare should cost an error
+    // message, not a capture session.
+    let specs = match args
+        .compare
+        .iter()
+        .map(|t| Spec::parse(t, &args))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Ошибка: {e}");
+            std::process::exit(2);
+        }
+    };
+    if !specs.is_empty() && args.codec != Codec::None {
+        eprintln!(
+            "Ошибка: --encode и --compare вместе не работают. --compare задаёт\n\
+             кодеки сам; --encode здесь означал бы ещё один, невидимый в таблице."
+        );
+        std::process::exit(2);
+    }
 
     // The machine comes first, before any number, so a VM run cannot be mistaken
     // for a target run further down the page.
@@ -381,49 +558,117 @@ fn main() {
     // The YUV frame persists between frames for the same reason the BGRA buffer
     // does: conversion only touches what changed, so everything else has to
     // still hold the previous frame. It also fixes the encoded resolution.
-    let mut yuv = I420::new(w, h, args.scale);
-    let (ew, eh) = (yuv.width, yuv.height);
-
-    let mut encoder = match build_encoder(&args, ew, eh) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("\nОшибка: {e}");
-            std::process::exit(1);
-        }
+    // One conversion buffer per distinct scale. Each persists between frames for
+    // the same reason the BGRA buffer does: conversion only touches what
+    // changed, so everything else has to still hold the previous frame.
+    let mut scales: Vec<u32> = if specs.is_empty() {
+        vec![args.scale]
+    } else {
+        specs.iter().map(|s| s.scale).collect()
     };
-    if args.codec != Codec::None {
+    scales.sort_unstable();
+    scales.dedup();
+    let mut planes: Vec<I420> = scales.iter().map(|&s| I420::new(w, h, s)).collect();
+    // Which buffer each configuration reads. Two configurations at the same
+    // scale share one conversion: it happens once and is charged to both, which
+    // is what each would cost alone rather than what they cost together.
+    let plane_of: Vec<usize> = specs
+        .iter()
+        .map(|s| {
+            scales
+                .iter()
+                .position(|&x| x == s.scale)
+                .expect("масштаб взят из этого же списка")
+        })
+        .collect();
+    let mut convert_by_scale = vec![0u64; planes.len()];
+
+    let mut encoder = None;
+    let mut encoders = Vec::new();
+    let mut track_labels: Vec<(String, u32, u32)> = Vec::new();
+
+    if specs.is_empty() {
+        let (ew, eh) = (planes[0].width, planes[0].height);
+        encoder = match build_encoder(&args, ew, eh) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("\nОшибка: {e}");
+                std::process::exit(1);
+            }
+        };
+        if args.codec != Codec::None {
+            if !args.readback.wants_pixels() {
+                eprintln!("\nОшибка: кодировать нечего — копирование пикселей выключено.");
+                std::process::exit(2);
+            }
+            println!(
+                "Кодирование: {} в {ew}×{eh} при {} кбит/с, cpu-used {}, потоков {}.",
+                args.codec.name(),
+                args.bitrate_kbps,
+                args.cpu_used,
+                args.threads
+            );
+        }
+        // Outside the codec branch: --scale changes the conversion cost too, and
+        // a run that quietly measured a different resolution than the operator
+        // thinks is a run whose numbers mean something else.
+        if args.scale > 1 {
+            println!(
+                "Кадр уменьшен в {} раза: {ew}×{eh}, то есть {:.0}% пикселей.",
+                args.scale,
+                100.0 / (args.scale * args.scale) as f64
+            );
+        }
+    } else {
         if !args.readback.wants_pixels() {
-            eprintln!("\nОшибка: кодировать нечего — копирование пикселей выключено.");
+            eprintln!("\nОшибка: сравнивать нечего — копирование пикселей выключено.");
             std::process::exit(2);
         }
+        encoders = match build_compare_encoders(&specs, &planes, &plane_of, args.fps) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("\nОшибка: {e}");
+                std::process::exit(1);
+            }
+        };
         println!(
-            "Кодирование: {} в {ew}×{eh} при {} кбит/с, cpu-used {}, потоков {}.",
-            args.codec.name(),
-            args.bitrate_kbps,
-            args.cpu_used,
-            args.threads
+            "Сравнение на одних и тех же кадрах, {}:",
+            spike_metrics::plural(specs.len() as u64, "конфигурация", "конфигурации", "конфигураций")
         );
-    }
-    // Outside the codec branch: --scale changes the conversion cost too, and a
-    // run that quietly measured a different resolution than the operator thinks
-    // is a run whose numbers mean something else.
-    if args.scale > 1 {
+        for (i, spec) in specs.iter().enumerate() {
+            let plane = &planes[plane_of[i]];
+            println!(
+                "  {:<14} {} в {}×{}, {} кбит/с, cpu-used {}, потоков {}",
+                spec.label,
+                spec.codec.name(),
+                plane.width,
+                plane.height,
+                spec.bitrate_kbps,
+                spec.cpu_used,
+                spec.threads
+            );
+            track_labels.push((spec.label.clone(), plane.width, plane.height));
+        }
+        println!("Порядок кодирования чередуется по кадрам.");
         println!(
-            "Кадр уменьшен в {} раза: {ew}×{eh}, то есть {:.0}% пикселей.",
-            args.scale,
-            100.0 / (args.scale * args.scale) as f64
+            "Частота кадров здесь занижена: на каждый кадр {} подряд.",
+            spike_metrics::plural(specs.len() as u64, "кодирование", "кодирования", "кодирований")
         );
     }
 
     let mut first_frame = true;
+    let mut rotate = 0usize;
 
     let mut rec = Recorder::new(format!("Захват · {}", source.describe()), w, h, args.fps);
+    for (label, tw, th) in track_labels {
+        rec.add_track(label, tw, th);
+    }
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     // One frame interval, so a still screen blocks instead of spinning.
     let timeout = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
     let started = Instant::now();
 
-    while Instant::now() < deadline {
+    'run: while Instant::now() < deadline {
         let t0 = Instant::now();
         match source.next_frame(timeout, args.readback) {
             Ok(Some(frame)) => {
@@ -444,20 +689,66 @@ fn main() {
                         (Dirty::Rects(r), false) => r,
                         _ => std::slice::from_ref(&whole),
                     };
-                    let t = Instant::now();
-                    yuv.convert_bgra(bgra, frame.stride, rects);
-                    convert_us = t.elapsed().as_micros() as u64;
                     first_frame = false;
 
-                    if let Some(enc) = encoder.as_mut() {
+                    if specs.is_empty() {
                         let t = Instant::now();
-                        match encode_one(enc, &yuv) {
-                            Ok(out) => encoded = Some((t.elapsed().as_micros() as u64, out)),
-                            Err(e) => {
-                                eprintln!("Кодирование прекращено: {e}");
-                                break;
+                        planes[0].convert_bgra(bgra, frame.stride, rects);
+                        convert_us = t.elapsed().as_micros() as u64;
+
+                        if let Some(enc) = encoder.as_mut() {
+                            let t = Instant::now();
+                            match encode_one(enc, &planes[0]) {
+                                Ok(out) => encoded = Some((t.elapsed().as_micros() as u64, out)),
+                                Err(e) => {
+                                    eprintln!("Кодирование прекращено: {e}");
+                                    break;
+                                }
                             }
                         }
+                    } else {
+                        // Convert once per distinct scale, before any encoding,
+                        // so no configuration is charged for another's work.
+                        for (i, plane) in planes.iter_mut().enumerate() {
+                            let t = Instant::now();
+                            plane.convert_bgra(bgra, frame.stride, rects);
+                            convert_by_scale[i] = t.elapsed().as_micros() as u64;
+                        }
+
+                        // Capture and copy happened once and belong to every
+                        // configuration equally.
+                        let shared_us = frame.work_us + frame.readback_us;
+                        let n = specs.len();
+                        for k in 0..n {
+                            // Rotate the order every frame. Whoever encodes first
+                            // pays for a cold cache and gets the processor before
+                            // it has heated up; over a run that would otherwise
+                            // always be the same configuration, and the operator
+                            // would read it as a property of the codec.
+                            let i = (k + rotate) % n;
+                            let plane = &planes[plane_of[i]];
+                            let t = Instant::now();
+                            match encode_one(&mut encoders[i], plane) {
+                                Ok(out) => rec.record_track(
+                                    i,
+                                    &TrackStat {
+                                        shared_us,
+                                        convert_us: convert_by_scale[plane_of[i]],
+                                        encode_us: t.elapsed().as_micros() as u64,
+                                        bytes: out.bytes,
+                                        keyframe: out.keyframe,
+                                    },
+                                ),
+                                Err(e) => {
+                                    eprintln!(
+                                        "Кодирование прекращено на «{}»: {e}",
+                                        specs[i].label
+                                    );
+                                    break 'run;
+                                }
+                            }
+                        }
+                        rotate += 1;
                     }
                 }
 
@@ -507,5 +798,68 @@ fn main() {
     if report.frames_new == 0 {
         println!("\n⚠ Ни одного кадра с содержимым. Экран был статичен весь прогон,");
         println!("  либо источник не отдаёт кадры. Смотрите строки выше про источник.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Args {
+        Args::default()
+    }
+
+    #[test]
+    fn a_bare_codec_takes_everything_from_the_run() {
+        let s = Spec::parse("vp9", &args()).expect("vp9 разбирается");
+        assert_eq!(s.codec, Codec::Vp9);
+        assert_eq!(s.scale, args().scale);
+        assert_eq!(s.threads, args().threads);
+        assert_eq!(s.cpu_used, args().cpu_used);
+        assert_eq!(s.bitrate_kbps, args().bitrate_kbps);
+        // The label is what the operator typed, so the table names the run back
+        // to them rather than a reconstruction of it.
+        assert_eq!(s.label, "vp9");
+    }
+
+    #[test]
+    fn parts_may_come_in_any_order() {
+        let a = Spec::parse("vp8:s2:t4:c9:b1500", &args()).expect("прямой порядок");
+        let b = Spec::parse("vp8:b1500:c9:t4:s2", &args()).expect("обратный порядок");
+        assert_eq!((a.scale, a.threads, a.cpu_used, a.bitrate_kbps), (2, 4, 9, 1_500));
+        assert_eq!((a.scale, a.threads, a.cpu_used, a.bitrate_kbps),
+                   (b.scale, b.threads, b.cpu_used, b.bitrate_kbps));
+        assert_eq!(a.codec, Codec::Vp8);
+    }
+
+    #[test]
+    fn a_negative_cpu_used_is_a_real_setting_not_a_typo() {
+        let s = Spec::parse("vp9:c-1", &args()).expect("libvpx принимает отрицательные");
+        assert_eq!(s.cpu_used, -1);
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_guessed() {
+        for text in ["", "h264", "none", "vp9:s0", "vp9:s9", "vp9:t0", "vp9:z2", "vp9:sдва", "vp9:"] {
+            assert!(Spec::parse(text, &args()).is_err(), "«{text}» должно было отвергнуться");
+        }
+    }
+
+    /// A Cyrillic letter where a Latin tag was meant must produce a message, not
+    /// a panic: splitting the part by byte would have cut a two-byte codepoint in
+    /// half. Easy to type by accident with a Russian keyboard layout, and `с`
+    /// looks exactly like `s`.
+    #[test]
+    fn a_cyrillic_typo_gets_an_error_and_not_a_panic() {
+        assert!(Spec::parse("vp9:с2", &args()).is_err());
+        assert!(Spec::parse("vp9:—", &args()).is_err());
+        assert!(Spec::parse("вп9", &args()).is_err());
+    }
+
+    #[test]
+    fn whitespace_around_a_configuration_is_forgiven() {
+        let s = Spec::parse("  vp9:s2  ", &args()).expect("пробелы от --compare с пробелами");
+        assert_eq!(s.scale, 2);
+        assert_eq!(s.label, "vp9:s2");
     }
 }
