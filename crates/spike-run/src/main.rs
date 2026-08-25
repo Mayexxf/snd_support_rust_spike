@@ -254,6 +254,7 @@ fn main() {
     // for a target run further down the page.
     let machine = Machine::detect();
     print!("{}", machine.render());
+    println!("  сборка стенда           {}", env!("SPIKE_BUILD"));
 
     let mut source = match build_source(&args) {
         Ok(s) => s,
