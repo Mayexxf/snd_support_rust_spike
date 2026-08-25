@@ -31,5 +31,24 @@
 # is the right one for the product — use `--config .cargo/static-crt.toml`
 # with it. It is not the default here only because the network that has to run
 # this cannot reach vcpkg's mirrors.
+# ---------------------------------------------------------------------------
+# On /IGNORE:4099
+#
+# The prebuilt libvpx.lib carries references to a libvpx.pdb that the archive
+# does not ship, so the linker emits LNK4099 once per object file — around two
+# hundred lines of "linking object as if no debug info". Harmless: nobody steps
+# through libvpx here, and the code linked is identical either way.
+#
+# It is silenced because that wall of text buries the linker warnings that do
+# matter. LNK4098 — a C runtime mismatch — is exactly the class of message this
+# project has already been bitten by, and it looks just like the noise. One
+# warning number is suppressed by name; everything else still shows.
+#
+# NOT VERIFIED on a Windows machine: some versions of link.exe list LNK4099
+# among the warnings that /IGNORE refuses to suppress. If it still appears,
+# leave it — the flag costs nothing when it does nothing. The certain fix is
+# debug = 0 in [profile.release], because then no PDB is produced at all and
+# the warning has nothing to complain about; the price is a panic without a
+# file and line, which this harness has needed more than once.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64"]
+rustflags = ["-C", "target-cpu=x86-64", "-C", "link-arg=/IGNORE:4099"]
