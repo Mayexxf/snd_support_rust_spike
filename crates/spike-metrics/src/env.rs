@@ -148,21 +148,33 @@ fn feature(_name: &str) -> Option<bool> {
     None
 }
 
+/// One CPUID leaf.
+///
+/// The `unsafe` here is version-dependent: newer compilers consider `__cpuid`
+/// safe on x86_64 (it needs no target feature beyond the baseline) and warn that
+/// the block is redundant, while the declared MSRV still requires it. Rather
+/// than guess the exact release that changed, the requirement is satisfied and
+/// the warning suppressed in one place — scoped to this three-line function, so
+/// it cannot hide a redundant `unsafe` anywhere else.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+fn cpuid(leaf: u32) -> std::arch::x86_64::CpuidResult {
+    // SAFETY: CPUID is unconditionally available on x86_64, the leaves this
+    // module reads are architecturally defined, and the instruction has no side
+    // effects and touches no memory.
+    unsafe { std::arch::x86_64::__cpuid(leaf) }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn cpu_brand() -> Option<String> {
-    use std::arch::x86_64::__cpuid;
-
-    // SAFETY: leaf 0x80000000 is defined on every x86_64 part; the call has no
-    // side effects and touches no memory.
-    let max_ext = unsafe { __cpuid(0x8000_0000) }.eax;
+    let max_ext = cpuid(0x8000_0000).eax;
     if max_ext < 0x8000_0004 {
         return None;
     }
 
     let mut bytes = Vec::with_capacity(48);
     for leaf in 0x8000_0002u32..=0x8000_0004 {
-        // SAFETY: guarded by max_ext above.
-        let r = unsafe { __cpuid(leaf) };
+        let r = cpuid(leaf);
         for reg in [r.eax, r.ebx, r.ecx, r.edx] {
             bytes.extend_from_slice(&reg.to_le_bytes());
         }
@@ -182,19 +194,16 @@ fn cpu_brand() -> Option<String> {
 
 #[cfg(target_arch = "x86_64")]
 fn hypervisor() -> Option<String> {
-    use std::arch::x86_64::__cpuid;
-
-    // SAFETY: leaf 1 is defined everywhere; no side effects.
-    // ECX bit 31 is the "hypervisor present" bit. Real silicon leaves it clear;
-    // every mainstream hypervisor sets it, and none of them has a reason to lie
-    // in the direction that matters here.
-    if unsafe { __cpuid(1) }.ecx & (1 << 31) == 0 {
+    // ECX bit 31 of leaf 1 is the "hypervisor present" bit. Real silicon leaves
+    // it clear; every mainstream hypervisor sets it, and none of them has a
+    // reason to lie in the direction that matters here.
+    if cpuid(1).ecx & (1 << 31) == 0 {
         return None;
     }
 
-    // SAFETY: only reached when the hypervisor bit is set, which is what makes
-    // the 0x40000000 leaf range meaningful.
-    let r = unsafe { __cpuid(0x4000_0000) };
+    // Only meaningful once the hypervisor bit is set: leaf 0x40000000 is the
+    // hypervisor vendor range, and on bare metal it returns whatever it likes.
+    let r = cpuid(0x4000_0000);
     let mut bytes = Vec::with_capacity(12);
     for reg in [r.ebx, r.ecx, r.edx] {
         bytes.extend_from_slice(&reg.to_le_bytes());
