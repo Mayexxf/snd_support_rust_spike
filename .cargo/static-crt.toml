@@ -1,0 +1,16 @@
+# Flags for a self-contained binary: static C runtime, no Visual C++
+# Redistributable needed on the machine that runs it.
+#
+# Use with:  cargo build --config .cargo/static-crt.toml --features vpx
+#
+# Only works against a libvpx that was itself built against the static runtime —
+# in practice vcpkg's x64-windows-static triplet. The prebuilt SDKs from
+# ShiftMediaProject are built against the dynamic runtime and will fail to link
+# with these flags.
+#
+# target-cpu=x86-64 is restated because a file passed with --config replaces the
+# rustflags of .cargo/config.toml rather than adding to them. Losing it is what
+# kills the binary on a Celeron with 0xc000001d before the first log line, so it
+# is written out here where its absence would be visible.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64", "-C", "target-feature=+crt-static"]

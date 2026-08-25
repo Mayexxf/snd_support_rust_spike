@@ -1,18 +1,35 @@
 # Pin the generic x86-64 baseline for the Windows target.
 #
-# Carried over from the client repository, and here it is not belt-and-braces but
-# the point of the exercise. The whole question phase 0 asks is "does a Celeron
-# N3150 (Braswell: SSE4.2, no AVX) keep up?". A harness compiled for the build
-# machine's CPU answers a different question — and on the target it does not
-# answer any question at all, because it dies with STATUS_ILLEGAL_INSTRUCTION
+# This flag is not negotiable. The whole question phase 0 asks is "does a
+# Celeron N3150 (Braswell: SSE4.2, no AVX) keep up?". A harness compiled for the
+# build machine's CPU answers a different question — and on the target it does
+# not answer any question at all, because it dies with STATUS_ILLEGAL_INSTRUCTION
 # (0xc000001d) before the first frame, exactly as the predecessor did.
 #
 # NEVER set target-cpu to native, haswell, or x86-64-v3 here.
 #
-# +crt-static removes the Visual C++ Redistributable dependency, so the harness
-# is one file that can be copied to the target machine and run.
+# ---------------------------------------------------------------------------
+# On the missing +crt-static
 #
-# Scoped to the Windows target on purpose: under [build] it would also hit host
-# builds, and an aarch64 Mac rejects "x86-64" as a processor name.
+# It used to be here, and it is what the client product ships with, because a
+# statically linked C runtime means one self-contained file and no dependency on
+# the Visual C++ Redistributable — which a neglected old machine often lacks,
+# and whose absence is a silent non-start: no window, no log entry.
+#
+# It is absent because the prebuilt libvpx this harness links against is built
+# against the *dynamic* runtime (235 DEFAULTLIB:"MSVCRT" directives in its
+# libvpx.lib). Mixing the two ends in LNK2038, or — as it did here — in
+# unresolved __imp_round, __imp__beginthreadex and __imp_fopen: libvpx asking
+# for imports while our side supplies static symbols.
+#
+# So the measurement binary needs the Visual C++ Redistributable on whatever
+# machine runs it. Install it on the target Celeron before the trip; discovering
+# it there costs the trip.
+#
+# Building libvpx through vcpkg with the x64-windows-static triplet avoids all
+# of this. That path keeps the static runtime and the self-contained binary, and
+# is the right one for the product — use `--config .cargo/static-crt.toml`
+# with it. It is not the default here only because the network that has to run
+# this cannot reach vcpkg's mirrors.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=x86-64"]
