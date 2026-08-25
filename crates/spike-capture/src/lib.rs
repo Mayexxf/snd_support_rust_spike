@@ -134,6 +134,16 @@ pub trait FrameSource {
 
     /// Rebuild after [`CaptureError::AccessLost`].
     fn reinit(&mut self) -> Result<(), CaptureError>;
+
+    /// Reasons this source's numbers do not describe the machine we care about.
+    ///
+    /// Separate from [`FrameSource::describe`] because these have to be shouted,
+    /// not mentioned. A capture running on a software rasteriser produces
+    /// perfectly plausible timings that mean nothing about a real GPU, and a
+    /// plausible wrong number is worse than a missing one.
+    fn caveats(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

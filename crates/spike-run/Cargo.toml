@@ -14,3 +14,8 @@ path = "src/main.rs"
 [dependencies]
 spike-metrics.workspace = true
 spike-capture.workspace = true
+
+# timeBeginPeriod only. Windows' default timer granularity is 15.6 ms, which
+# quantises every wait and silently caps the poll rate — see `timer` in main.rs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Media"] }

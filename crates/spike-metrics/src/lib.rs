@@ -350,6 +350,9 @@ impl Report {
     /// The thresholds are deliberately conservative — the client machine also has
     /// to run the wizard and whatever the user was actually doing.
     pub fn verdict(&self) -> Option<Verdict> {
+        if self.budget.len() < MIN_FRAMES_FOR_VERDICT {
+            return None;
+        }
         let share = self.budget_share(0.95)?;
         Some(if share < 0.5 {
             Verdict::Comfortable(share)
@@ -362,6 +365,18 @@ impl Report {
         })
     }
 }
+
+/// Frames of actual content below which no verdict is offered.
+///
+/// Nearest-rank p95 over `n` samples lands on index `ceil(0.95n)`, which for
+/// `n < 21` is simply the worst sample. A run of five content frames therefore
+/// reports p95 = p99 = max and would let the harness pronounce on a machine from
+/// a single bad frame. Thirty leaves the percentile something to choose from.
+///
+/// The practical consequence: an idle desktop measures how *often* the screen
+/// changes, and a scrolling one measures what a frame *costs*. One run cannot do
+/// both.
+pub const MIN_FRAMES_FOR_VERDICT: usize = 30;
 
 /// How the machine coped, at p95 of the per-frame working time.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -385,10 +400,10 @@ impl Verdict {
                 "запас есть. Машина успевает и оставляет процессор пользователю"
             }
             Verdict::Tight(_) => {
-                "впритык. Успевает, но на загруженной машине начнёт ронять кадры —                  снижайте разрешение или частоту"
+                "впритык. Успевает, но на загруженной машине начнёт ронять кадры. Снижайте разрешение или частоту"
             }
             Verdict::Marginal(_) => {
-                "почти не успевает. При любой посторонней нагрузке кадры поедут.                  Нужен другой режим: меньше разрешение, меньше частота, дешевле кодек"
+                "почти не успевает. При любой посторонней нагрузке кадры поедут. Нужен другой режим: меньше разрешение, меньше частота, дешевле кодек"
             }
             Verdict::Fails(_) => {
                 "НЕ УСПЕВАЕТ. Целевая частота недостижима в этой конфигурации"
@@ -467,6 +482,21 @@ impl std::fmt::Display for Report {
                 Verdict::Fails(_) => "✗",
             };
             writeln!(s, "  {mark} {}", v.explain())?;
+        } else if !self.budget.is_empty() {
+            writeln!(s, "\n-- Бюджет кадра --")?;
+            writeln!(
+                s,
+                "  Вердикта не будет: кадров с содержимым {}, нужно хотя бы {}.",
+                self.budget.len(),
+                MIN_FRAMES_FOR_VERDICT
+            )?;
+            writeln!(
+                s,
+                "  При таком числе p95 — это просто худший кадр из {}, и цифры выше",
+                self.budget.len()
+            )?;
+            writeln!(s, "  описывают один неудачный кадр, а не поведение машины.")?;
+            writeln!(s, "  Стоимость кадра меряется прогоном С ДВИЖЕНИЕМ на экране.")?;
         }
 
         if self.encoded_bytes_total > 0 {
@@ -596,7 +626,7 @@ mod tests {
         ];
         for (cost_us, expected) in cases {
             let mut r = Recorder::new("тест", 1920, 1080, 30);
-            for _ in 0..20 {
+            for _ in 0..MIN_FRAMES_FOR_VERDICT {
                 r.record(&FrameStat { is_new: true, work_us: cost_us, ..Default::default() });
             }
             let rep = r.finish(Duration::from_secs(1));
@@ -606,6 +636,40 @@ mod tests {
                 "при {cost_us} мкс ожидали «{expected}», получили «{}»",
                 v.explain()
             );
+        }
+    }
+
+    #[test]
+    fn a_handful_of_frames_earns_no_verdict() {
+        // The first real Windows run captured five content frames on an idle
+        // desktop and reported p95 = p99 = max, because nearest-rank p95 over
+        // five samples *is* the worst sample. A verdict from that describes one
+        // unlucky frame, not a machine.
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for _ in 0..(MIN_FRAMES_FOR_VERDICT - 1) {
+            r.record(&FrameStat { is_new: true, work_us: 1_000, ..Default::default() });
+        }
+        let rep = r.finish(Duration::from_secs(30));
+        assert!(rep.verdict().is_none());
+        // The section must still explain itself rather than silently vanish.
+        let text = rep.to_string();
+        assert!(text.contains("Вердикта не будет"), "{text}");
+        assert!(text.contains("С ДВИЖЕНИЕМ"), "{text}");
+    }
+
+    #[test]
+    fn verdict_strings_carry_no_runaway_whitespace() {
+        // These literals were once written through a script that ate their line
+        // continuations, leaving eighteen spaces mid-sentence in the report.
+        for v in [
+            Verdict::Comfortable(0.1),
+            Verdict::Tight(0.6),
+            Verdict::Marginal(0.9),
+            Verdict::Fails(1.5),
+        ] {
+            let text = v.explain();
+            assert!(!text.contains("  "), "двойной пробел в «{text}»");
+            assert!(!text.contains('\n'), "перенос строки в «{text}»");
         }
     }
 

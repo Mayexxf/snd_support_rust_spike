@@ -367,6 +367,26 @@ impl FrameSource for DdaSource {
         }))
     }
 
+    fn caveats(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // "Microsoft Basic Render Driver" is WARP, the CPU rasteriser Windows
+        // falls back to when no display driver is present — routine inside a VM.
+        // Direct3D still works, so capture succeeds and the timings look sane,
+        // but nothing here touched a GPU: the readback measured main memory, not
+        // a bus transfer. On a real Braswell iGPU that stage behaves differently
+        // in both directions, and reading these numbers as an answer about it
+        // would be a mistake the harness has to prevent, not enable.
+        let name = self.adapter_name.to_lowercase();
+        if name.contains("basic render") || name.contains("basic display") || name.contains("warp") {
+            out.push(format!(
+                "адаптер «{}» — программный растеризатор, настоящего GPU нет. \
+                 Строка «копирование в память» меряет память, а не шину GPU",
+                self.adapter_name
+            ));
+        }
+        out
+    }
+
     fn reinit(&mut self) -> Result<(), CaptureError> {
         // Drop the dead object *first*. DXGI allows one duplication per output
         // per device, so rebuilding while the old one is still alive fails with

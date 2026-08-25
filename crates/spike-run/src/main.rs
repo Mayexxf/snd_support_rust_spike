@@ -18,6 +18,74 @@ use spike_metrics::{FrameStat, Recorder, env::Machine};
 const DEFAULT_SECONDS: u64 = 30;
 const DEFAULT_FPS: u32 = 30;
 
+/// Raise the system timer resolution for the duration of the run.
+///
+/// Measured, not assumed. On the first Windows run a 33 ms timeout produced a
+/// 46.7 ms wait — and 15.625 × 3 = 46.875. Windows' default timer granularity is
+/// 15.6 ms, so every wait is rounded *up* to the next multiple, and a harness
+/// asking for 30 fps quietly polls at about 21.
+///
+/// Left unfixed this understates the frame rate of every machine measured, and
+/// on the target it would look like the Celeron falling behind when the truth is
+/// that nobody ever asked it for 30 fps. A real capture product raises the
+/// resolution for the same reason.
+///
+/// The guard restores the previous resolution on drop: leaving it raised costs
+/// the whole machine battery life.
+mod timer {
+    pub struct Resolution {
+        #[cfg(windows)]
+        period_ms: Option<u32>,
+    }
+
+    impl Resolution {
+        #[cfg(windows)]
+        pub fn raise() -> Self {
+            use windows::Win32::Media::{TIMECAPS, timeBeginPeriod, timeGetDevCaps};
+
+            let mut caps = TIMECAPS { wPeriodMin: 0, wPeriodMax: 0 };
+            // SAFETY: `caps` is a live, correctly sized TIMECAPS.
+            let ok = unsafe { timeGetDevCaps(&mut caps, size_of::<TIMECAPS>() as u32) };
+            if ok != 0 || caps.wPeriodMin == 0 {
+                return Self { period_ms: None };
+            }
+            // SAFETY: the period is within the range the system just reported.
+            if unsafe { timeBeginPeriod(caps.wPeriodMin) } != 0 {
+                return Self { period_ms: None };
+            }
+            Self { period_ms: Some(caps.wPeriodMin) }
+        }
+
+        #[cfg(not(windows))]
+        pub fn raise() -> Self {
+            Self {}
+        }
+
+        pub fn describe(&self) -> String {
+            #[cfg(windows)]
+            {
+                return match self.period_ms {
+                    Some(ms) => format!("разрешение таймера поднято до {ms} мс"),
+                    None => "разрешение таймера поднять не удалось — ожидания                              квантуются шагом 15,6 мс, частота кадров занижена"
+                        .to_owned(),
+                };
+            }
+            #[cfg(not(windows))]
+            "разрешение таймера — как в системе".to_owned()
+        }
+    }
+
+    impl Drop for Resolution {
+        fn drop(&mut self) {
+            #[cfg(windows)]
+            if let Some(ms) = self.period_ms {
+                // SAFETY: matches the successful timeBeginPeriod above.
+                unsafe { windows::Win32::Media::timeEndPeriod(ms) };
+            }
+        }
+    }
+}
+
 struct Args {
     source: String,
     motion: synthetic::Motion,
@@ -180,8 +248,15 @@ fn main() {
         }
     };
 
+    let _timer = timer::Resolution::raise();
+
     let (w, h) = source.dimensions();
-    println!("\n=== Источник ===\n  {}\n", source.describe());
+    println!("\n=== Источник ===\n  {}", source.describe());
+    println!("  {}", _timer.describe());
+    for caveat in source.caveats() {
+        println!("\n  ⚠ {caveat}");
+    }
+    println!();
     println!(
         "Прогон {} с при цели {} к/с, копирование пикселей {}.",
         args.seconds,
