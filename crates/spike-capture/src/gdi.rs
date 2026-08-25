@@ -194,6 +194,9 @@ impl FrameSource for GdiSource {
             } else {
                 0
             },
+            // Nothing to compare against: without change information there is no
+            // second path to time.
+            compare_us: None,
         }))
     }
 

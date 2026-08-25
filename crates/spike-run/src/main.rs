@@ -124,10 +124,11 @@ fn usage() -> &'static str {
     --seconds <N>                      длительность прогона (по умолчанию 30)
     --fps <N>                          целевая частота (по умолчанию 30)
     --size <ШxВ>                       размер для синтетического источника
-    --readback <dirty|full|off>        что копировать из памяти GPU:
-                                       dirty — только изменившиеся области (по умолчанию)
-                                       full  — весь кадр каждый раз
-                                       off   — ничего, замер одного лишь захвата
+    --readback <dirty|full|compare|off>  что копировать из памяти GPU:
+                                       dirty   — только изменившиеся области (по умолчанию)
+                                       full    — весь кадр каждый раз
+                                       compare — оба пути на одном кадре, с замером
+                                       off     — ничего, замер одного лишь захвата
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -136,10 +137,9 @@ fn usage() -> &'static str {
     spike --source dda --seconds 60                    прокрутка: крутить документ вручную
     spike --source synthetic --motion scroll           проверка стенда без настоящего экрана
 
-Сравнение путей копирования — два прогона подряд, одинаково крутя документ:
+Сравнение путей копирования — ОДИН прогон, оба пути на каждом кадре:
 
-    spike --readback full --seconds 30
-    spike --readback dirty --seconds 30
+    spike --readback compare --seconds 30
 "
 }
 
@@ -280,6 +280,7 @@ fn main() {
             Readback::Off => "выключено",
             Readback::Full => "весь кадр",
             Readback::Dirty => "только изменившиеся области",
+            Readback::Compare => "оба пути на каждом кадре (сравнение)",
         }
     );
     if matches!(args.source.as_str(), "dda" | "auto") {
@@ -305,6 +306,7 @@ fn main() {
                     changed_px: frame.dirty.area(frame.width, frame.height),
                     dirty_rects: frame.dirty.count(),
                     copied_px: frame.copied_px,
+                    compare_us: frame.compare_us,
                     // Encoding is wired in the second pass, once libvpx builds on
                     // the target. The accounting for it is already in place.
                     encode_us: None,

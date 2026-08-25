@@ -62,6 +62,9 @@ pub struct DdaSource {
     /// full one however the caller asked. Without this the first frame after a
     /// UAC prompt would be three quarters uninitialised memory.
     force_full: bool,
+    /// Frames copied so far. Only used to alternate path order in comparison
+    /// runs, so wrapping is fine.
+    frames_done: u64,
 }
 
 impl DdaSource {
@@ -145,6 +148,7 @@ impl DdaSource {
                 buf: Vec::new(),
                 stride: 0,
                 force_full: true,
+                frames_done: 0,
             })
         }
     }
@@ -198,17 +202,15 @@ impl DdaSource {
         Dirty::Rects(std::mem::take(&mut self.dirty))
     }
 
-    /// Copy the frame out of GPU memory.
+    /// Make sure the staging texture matches the frame, then hand both back.
     ///
-    /// Returns microseconds spent and pixels actually moved.
-    unsafe fn readback(
+    /// Split out of the copy paths so their timings measure copying and nothing
+    /// else — a run where the texture happened to be rebuilt would otherwise
+    /// charge that to whichever path went first.
+    unsafe fn prepare(
         &mut self,
         resource: &IDXGIResource,
-        mode: Readback,
-        dirty: &Dirty,
-    ) -> Result<(u64, u64), CaptureError> {
-        let started = Instant::now();
-
+    ) -> Result<(ID3D11Texture2D, ID3D11Texture2D, D3D11_TEXTURE2D_DESC), CaptureError> {
         let src: ID3D11Texture2D = resource
             .cast()
             .map_err(|e| CaptureError::Failed(format!("кадр не текстура: {e}")))?;
@@ -247,8 +249,7 @@ impl DdaSource {
             self.staging = tex;
             self.width = desc.Width;
             self.height = desc.Height;
-            // A new staging texture and a resized CPU buffer share nothing with
-            // the previous frame.
+            // A new staging texture shares nothing with the previous frame.
             self.force_full = true;
         }
 
@@ -258,84 +259,97 @@ impl DdaSource {
             .ok_or_else(|| CaptureError::Failed("staging-текстура отсутствует".into()))?
             .clone();
 
-        // Regions to move. `Dirty::Unknown` means the driver told us nothing, so
-        // the honest answer is the whole screen rather than an empty list.
-        let rects: Vec<Rect> = match (mode, dirty, self.force_full) {
-            (Readback::Dirty, Dirty::Rects(r), false) => r
-                .iter()
-                .map(|r| clamp(*r, desc.Width, desc.Height))
-                .filter(|r| r.area() > 0)
-                .collect(),
-            _ => vec![Rect {
-                left: 0,
-                top: 0,
-                right: desc.Width as i32,
-                bottom: desc.Height as i32,
-            }],
-        };
-
-        let full_frame = rects.len() == 1
-            && rects[0].left == 0
-            && rects[0].top == 0
-            && rects[0].right == desc.Width as i32
-            && rects[0].bottom == desc.Height as i32;
-
-        if full_frame {
-            // SAFETY: both textures are live and share a description.
-            unsafe { self.context.CopyResource(&staging, &src) };
-        } else {
-            for r in &rects {
-                let box_ = D3D11_BOX {
-                    left: r.left as u32,
-                    top: r.top as u32,
-                    front: 0,
-                    right: r.right as u32,
-                    bottom: r.bottom as u32,
-                    back: 1,
-                };
-                // Destination coordinates match the source: the staging texture
-                // keeps a full-frame image that is patched in place, which is
-                // what makes a partial copy legal at all.
-                // SAFETY: the box is clamped to the source dimensions above and
-                // both resources share a format.
-                unsafe {
-                    self.context.CopySubresourceRegion(
-                        &staging,
-                        0,
-                        r.left as u32,
-                        r.top as u32,
-                        0,
-                        &src,
-                        0,
-                        Some(&box_),
-                    );
-                }
-            }
-        }
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: `mapped` is live; the matching Unmap runs before returning.
-        unsafe {
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| CaptureError::Failed(format!("Map: {e}")))?;
-        }
-
         let row_bytes = desc.Width as usize * 4;
         self.stride = row_bytes;
         let total = row_bytes * desc.Height as usize;
         if self.buf.len() != total {
             self.buf.resize(total, 0);
+            self.force_full = true;
         }
 
+        Ok((src, staging, desc))
+    }
+
+    /// Copy the whole frame. Returns microseconds and pixels moved.
+    unsafe fn copy_full(
+        &mut self,
+        src: &ID3D11Texture2D,
+        staging: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> Result<(u64, u64), CaptureError> {
+        let started = Instant::now();
+        // SAFETY: both textures are live and share a description.
+        unsafe { self.context.CopyResource(staging, src) };
+        let full = Rect { left: 0, top: 0, right: desc.Width as i32, bottom: desc.Height as i32 };
+        let px = unsafe { self.map_and_copy(staging, desc, std::slice::from_ref(&full))? };
+        Ok((started.elapsed().as_micros() as u64, px))
+    }
+
+    /// Copy only the given regions. Returns microseconds and pixels moved.
+    unsafe fn copy_regions(
+        &mut self,
+        src: &ID3D11Texture2D,
+        staging: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        rects: &[Rect],
+    ) -> Result<(u64, u64), CaptureError> {
+        let started = Instant::now();
+        for r in rects {
+            let box_ = D3D11_BOX {
+                left: r.left as u32,
+                top: r.top as u32,
+                front: 0,
+                right: r.right as u32,
+                bottom: r.bottom as u32,
+                back: 1,
+            };
+            // Destination coordinates match the source: the staging texture keeps
+            // a full-frame image that is patched in place, which is what makes a
+            // partial copy legal at all.
+            // SAFETY: the box is clamped to the source dimensions by the caller
+            // and both resources share a format.
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    staging,
+                    0,
+                    r.left as u32,
+                    r.top as u32,
+                    0,
+                    src,
+                    0,
+                    Some(&box_),
+                );
+            }
+        }
+        let px = unsafe { self.map_and_copy(staging, desc, rects)? };
+        Ok((started.elapsed().as_micros() as u64, px))
+    }
+
+    /// Map the staging texture and pull the given regions into the CPU buffer.
+    unsafe fn map_and_copy(
+        &mut self,
+        staging: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        rects: &[Rect],
+    ) -> Result<u64, CaptureError> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `mapped` is live; the matching Unmap runs before returning.
+        unsafe {
+            self.context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| CaptureError::Failed(format!("Map: {e}")))?;
+        }
+
+        let row_bytes = desc.Width as usize * 4;
+
         // SAFETY: the mapped region holds `RowPitch * Height` readable bytes, and
-        // every row range below is clamped to the texture. RowPitch is often
-        // larger than width*4 — copying it wholesale would misalign every row.
-        let copied_px = unsafe {
+        // every row range is clamped to the texture by the caller. RowPitch is
+        // often larger than width*4 — copying it wholesale would misalign rows.
+        let px = unsafe {
             let src_ptr = mapped.pData as *const u8;
             let pitch = mapped.RowPitch as usize;
             let mut px = 0u64;
-            for r in &rects {
+            for r in rects {
                 let x0 = r.left as usize * 4;
                 let span = (r.right - r.left) as usize * 4;
                 for y in r.top as usize..r.bottom as usize {
@@ -351,10 +365,75 @@ impl DdaSource {
         };
 
         // SAFETY: matches the successful Map above.
-        unsafe { self.context.Unmap(&staging, 0) };
+        unsafe { self.context.Unmap(staging, 0) };
+        Ok(px)
+    }
 
-        self.force_full = false;
-        Ok((started.elapsed().as_micros() as u64, copied_px))
+    /// Copy the frame out of GPU memory according to `mode`.
+    ///
+    /// Returns the cost of the path that would ship, the pixels it moved, and —
+    /// in [`Readback::Compare`] — what the other path cost on this same frame.
+    unsafe fn readback(
+        &mut self,
+        resource: &IDXGIResource,
+        mode: Readback,
+        dirty: &Dirty,
+    ) -> Result<(u64, u64, Option<u64>), CaptureError> {
+        // SAFETY: the resource is a live desktop frame.
+        let (src, staging, desc) = unsafe { self.prepare(resource)? };
+
+        // Regions to move. `Dirty::Unknown` means the driver told us nothing, so
+        // the honest answer is the whole screen rather than an empty list. The
+        // same goes for the first frame after a reset, where the rest of the
+        // buffer holds nothing worth keeping.
+        let partial: Option<Vec<Rect>> = match (dirty, self.force_full) {
+            (Dirty::Rects(r), false) => Some(
+                r.iter()
+                    .map(|r| clamp(*r, desc.Width, desc.Height))
+                    .filter(|r| r.area() > 0)
+                    .collect(),
+            ),
+            _ => None,
+        };
+
+        let result = match (mode, &partial) {
+            (Readback::Off, _) => (0, 0, None),
+
+            (Readback::Full, _) | (Readback::Dirty, None) | (Readback::Compare, None) => {
+                // SAFETY: prepared above.
+                let (us, px) = unsafe { self.copy_full(&src, &staging, &desc)? };
+                (us, px, None)
+            }
+
+            (Readback::Dirty, Some(rects)) => {
+                // SAFETY: rects are clamped to the texture.
+                let (us, px) = unsafe { self.copy_regions(&src, &staging, &desc, rects)? };
+                (us, px, None)
+            }
+
+            (Readback::Compare, Some(rects)) => {
+                // Alternate which path goes first. Whichever runs second finds
+                // the source rows warm, and always giving that advantage to the
+                // same path would bias the answer the run exists to produce.
+                // SAFETY: prepared above; rects are clamped.
+                let (dirty_us, px, full_us) = if self.frames_done % 2 == 0 {
+                    let (f, _) = unsafe { self.copy_full(&src, &staging, &desc)? };
+                    let (d, px) = unsafe { self.copy_regions(&src, &staging, &desc, rects)? };
+                    (d, px, f)
+                } else {
+                    let (d, px) = unsafe { self.copy_regions(&src, &staging, &desc, rects)? };
+                    let (f, _) = unsafe { self.copy_full(&src, &staging, &desc)? };
+                    (d, px, f)
+                };
+                (dirty_us, px, Some(full_us))
+            }
+        };
+
+        self.frames_done = self.frames_done.wrapping_add(1);
+        if mode.wants_pixels() {
+            self.force_full = false;
+        }
+        Ok(result)
     }
 }
 
@@ -422,7 +501,7 @@ impl FrameSource for DdaSource {
         // SAFETY: called while a frame is held.
         let dirty = unsafe { self.read_dirty(&info) };
 
-        let (readback_us, copied_px) = if readback.wants_pixels() {
+        let (readback_us, copied_px, compare_us) = if readback.wants_pixels() {
             match resource.as_ref() {
                 Some(res) => {
                     // SAFETY: the resource is valid until ReleaseFrame below.
@@ -442,7 +521,7 @@ impl FrameSource for DdaSource {
         } else {
             // SAFETY: a frame is held.
             let _ = unsafe { dupl.ReleaseFrame() };
-            (0, 0)
+            (0, 0, None)
         };
 
         let work_us = work_start
@@ -461,6 +540,7 @@ impl FrameSource for DdaSource {
             work_us,
             readback_us,
             copied_px,
+            compare_us,
         }))
     }
 

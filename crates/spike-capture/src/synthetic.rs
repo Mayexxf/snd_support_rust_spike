@@ -165,12 +165,20 @@ impl FrameSource for SyntheticSource {
         let painted: &[Rect] = match readback {
             Readback::Off => &[],
             Readback::Full => &full,
-            Readback::Dirty => &rects,
+            Readback::Dirty | Readback::Compare => &rects,
         };
         let paint_start = Instant::now();
         self.paint(painted);
         let painted_us = paint_start.elapsed().as_micros() as u64;
         let copied_px = painted.iter().map(Rect::area).sum();
+
+        // In comparison mode the full path is timed on the same frame, exactly
+        // as the real backend does it.
+        let compare_us = (readback == Readback::Compare).then(|| {
+            let started = Instant::now();
+            self.paint(&full);
+            started.elapsed().as_micros() as u64
+        });
         self.frame_no += 1;
 
         Ok(Some(Frame {
@@ -185,6 +193,7 @@ impl FrameSource for SyntheticSource {
             work_us: 0,
             readback_us: painted_us,
             copied_px,
+            compare_us,
         }))
     }
 

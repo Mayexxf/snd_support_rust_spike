@@ -120,6 +120,8 @@ pub struct FrameStat {
     pub encode_us: Option<u64>,
     /// Size of the encoded frame in bytes.
     pub encoded_bytes: Option<usize>,
+    /// In a comparison run, what the rejected copy path cost on this same frame.
+    pub compare_us: Option<u64>,
     /// Whether the encoder emitted a keyframe.
     pub is_keyframe: bool,
 }
@@ -134,6 +136,7 @@ pub struct Recorder {
     wait: Latencies,
     work: Latencies,
     readback: Latencies,
+    compare: Latencies,
     encode: Latencies,
     budget: Latencies,
     frames_seen: u64,
@@ -161,6 +164,7 @@ impl Recorder {
             wait: Latencies::default(),
             work: Latencies::default(),
             readback: Latencies::default(),
+            compare: Latencies::default(),
             encode: Latencies::default(),
             budget: Latencies::default(),
             frames_seen: 0,
@@ -189,6 +193,9 @@ impl Recorder {
         self.work.push(stat.work_us);
         if stat.readback_us > 0 {
             self.readback.push(stat.readback_us);
+        }
+        if let Some(us) = stat.compare_us {
+            self.compare.push(us);
         }
         // Everything the machine actually had to do for this frame. This is the
         // figure that decides whether the target keeps up, so it is accumulated
@@ -241,6 +248,7 @@ impl Recorder {
             wait: self.wait,
             work: self.work,
             readback: self.readback,
+            compare: self.compare,
             encode: self.encode,
             budget: self.budget,
             frames_seen: self.frames_seen,
@@ -271,6 +279,7 @@ pub struct Report {
     pub wait: Latencies,
     pub work: Latencies,
     pub readback: Latencies,
+    pub compare: Latencies,
     pub encode: Latencies,
     pub budget: Latencies,
     pub frames_seen: u64,
@@ -330,6 +339,17 @@ impl Report {
             return 0.0;
         }
         (self.copied_px_total as f64 / self.frames_new as f64) / px as f64
+    }
+
+    /// How many times cheaper the shipping copy path was, at the median.
+    ///
+    /// `None` outside a comparison run, and `None` if either side has no
+    /// samples. Reported at the median rather than p95 because the tails on a
+    /// shared machine are contention, not copying.
+    pub fn copy_speedup(&self) -> Option<f64> {
+        let ours = self.readback.percentile(0.50)?;
+        let other = self.compare.percentile(0.50)?;
+        (ours > 0).then(|| other as f64 / ours as f64)
     }
 
     /// Average bitrate over the whole run, in megabits per second.
@@ -529,6 +549,27 @@ impl std::fmt::Display for Report {
             writeln!(s, "  Стоимость кадра меряется прогоном С ДВИЖЕНИЕМ на экране.")?;
         }
 
+        if !self.compare.is_empty() {
+            writeln!(s, "\n-- Сравнение путей копирования, мс --")?;
+            writeln!(s, "                            p50    p95    p99    max")?;
+            writeln!(s, "  весь кадр            {}", self.compare.summary_ms())?;
+            writeln!(s, "  изменившиеся области {}", self.readback.summary_ms())?;
+            if let Some(x) = self.copy_speedup() {
+                writeln!(
+                    s,
+                    "\n  на медиане частичное копирование быстрее в {x:.1} раза"
+                )?;
+            }
+            writeln!(
+                s,
+                "  оба пути отработали ОДИН И ТОТ ЖЕ кадр, порядок чередуется"
+            )?;
+            writeln!(
+                s,
+                "  частота кадров в этом режиме занижена — на каждый кадр две копии"
+            )?;
+        }
+
         if self.encoded_bytes_total > 0 {
             writeln!(s, "\n-- Поток --")?;
             writeln!(s, "  средний битрейт         {:.2} Мбит/с", self.mbps())?;
@@ -712,6 +753,33 @@ mod tests {
         // an invented answer to the question phase 0 exists to ask.
         assert!(rep.verdict().is_none());
         let _ = rep.to_string();
+    }
+
+    #[test]
+    fn comparison_reports_the_speedup_at_the_median() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for _ in 0..MIN_FRAMES_FOR_VERDICT {
+            r.record(&FrameStat {
+                is_new: true,
+                readback_us: 4_000,
+                compare_us: Some(20_000),
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(10));
+        assert!((rep.copy_speedup().unwrap() - 5.0).abs() < 1e-9);
+        let text = rep.to_string();
+        assert!(text.contains("Сравнение путей копирования"), "{text}");
+        assert!(text.contains("быстрее в 5.0 раза"), "{text}");
+    }
+
+    #[test]
+    fn no_comparison_means_no_speedup_claimed() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        r.record(&FrameStat { is_new: true, readback_us: 4_000, ..Default::default() });
+        let rep = r.finish(Duration::from_secs(1));
+        assert!(rep.copy_speedup().is_none());
+        assert!(!rep.to_string().contains("Сравнение путей"));
     }
 
     #[test]

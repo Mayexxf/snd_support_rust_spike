@@ -91,6 +91,21 @@ pub enum Readback {
     /// Copy only the regions the backend reported as changed.
     #[default]
     Dirty,
+    /// Do both, on the same frame, and time them separately.
+    ///
+    /// Two separate runs cannot settle this question on a live desktop: nobody
+    /// scrolls twice the same way, so the two runs see different content, differ
+    /// in poll count, and the slower path accumulates more change per frame. The
+    /// first attempt produced 495 polls against 972 and matched on changed area
+    /// only by luck.
+    ///
+    /// Here both paths copy the *same* acquired frame, so the comparison holds
+    /// whatever the operator did with the mouse. The order alternates by frame
+    /// so neither path always pays the cold-cache cost.
+    ///
+    /// Costs two copies per frame, so the achieved frame rate of a comparison
+    /// run means nothing. The per-frame timings are the output.
+    Compare,
 }
 
 impl Readback {
@@ -99,6 +114,7 @@ impl Readback {
             "off" => Readback::Off,
             "full" => Readback::Full,
             "dirty" => Readback::Dirty,
+            "compare" => Readback::Compare,
             _ => return None,
         })
     }
@@ -137,6 +153,9 @@ pub struct Frame<'a> {
     /// either because it cannot do better or because the frame was the first
     /// after a reset. This is what was really paid for.
     pub copied_px: u64,
+    /// In [`Readback::Compare`], what the whole-frame path cost on this same
+    /// frame. `None` in every other mode.
+    pub compare_us: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -213,7 +232,9 @@ mod tests {
         assert_eq!(Readback::parse("dirty"), Some(Readback::Dirty));
         assert_eq!(Readback::parse("full"), Some(Readback::Full));
         assert_eq!(Readback::parse("off"), Some(Readback::Off));
+        assert_eq!(Readback::parse("compare"), Some(Readback::Compare));
         assert_eq!(Readback::parse("частично"), None);
+        assert!(Readback::Compare.wants_pixels());
         assert!(!Readback::Off.wants_pixels());
         assert!(Readback::Full.wants_pixels());
         assert!(Readback::Dirty.wants_pixels());
