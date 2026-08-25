@@ -1,0 +1,16 @@
+[package]
+name = "spike-run"
+description = "Phase-0 measurement runner: captures for a fixed time and prints what the machine managed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+spike-metrics.workspace = true
+spike-capture.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "spike-metrics"
+description = "Measurement core for the phase-0 harness: latency percentiles, frame accounting, CPU time and a report. Platform-independent, so it is under test on the development Mac."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+] }

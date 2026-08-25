@@ -1,0 +1,18 @@
+# Pin the generic x86-64 baseline for the Windows target.
+#
+# Carried over from the client repository, and here it is not belt-and-braces but
+# the point of the exercise. The whole question phase 0 asks is "does a Celeron
+# N3150 (Braswell: SSE4.2, no AVX) keep up?". A harness compiled for the build
+# machine's CPU answers a different question — and on the target it does not
+# answer any question at all, because it dies with STATUS_ILLEGAL_INSTRUCTION
+# (0xc000001d) before the first frame, exactly as the predecessor did.
+#
+# NEVER set target-cpu to native, haswell, or x86-64-v3 here.
+#
+# +crt-static removes the Visual C++ Redistributable dependency, so the harness
+# is one file that can be copied to the target machine and run.
+#
+# Scoped to the Windows target on purpose: under [build] it would also hit host
+# builds, and an aarch64 Mac rejects "x86-64" as a processor name.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64", "-C", "target-feature=+crt-static"]

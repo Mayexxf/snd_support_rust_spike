@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/spike-metrics", "crates/spike-capture", "crates/spike-run"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Sanador"]
+publish = false
+
+[workspace.dependencies]
+spike-metrics = { path = "crates/spike-metrics" }
+spike-capture = { path = "crates/spike-capture" }
+
+# Measurement builds are release builds. A debug build measures the debug
+# build's speed, which is nobody's question. Kept close to the client's release
+# profile so the numbers transfer, minus `strip` (we want symbols in a profiler)
+# and minus `panic = "abort"` (a panicking capture backend should unwind so the
+# report still prints what it managed to collect).
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = 1
