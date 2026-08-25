@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use spike_capture::{CaptureError, FrameSource, synthetic};
+use spike_capture::{CaptureError, FrameSource, Readback, synthetic};
 use spike_metrics::{FrameStat, Recorder, env::Machine};
 
 const DEFAULT_SECONDS: u64 = 30;
@@ -93,7 +93,7 @@ struct Args {
     fps: u32,
     width: u32,
     height: u32,
-    readback: bool,
+    readback: Readback,
 }
 
 impl Default for Args {
@@ -108,7 +108,7 @@ impl Default for Args {
             fps: DEFAULT_FPS,
             width: 1920,
             height: 1080,
-            readback: true,
+            readback: Readback::default(),
         }
     }
 }
@@ -124,14 +124,22 @@ fn usage() -> &'static str {
     --seconds <N>                      длительность прогона (по умолчанию 30)
     --fps <N>                          целевая частота (по умолчанию 30)
     --size <ШxВ>                       размер для синтетического источника
-    --no-readback                      не копировать пиксели в память
+    --readback <dirty|full|off>        что копировать из памяти GPU:
+                                       dirty — только изменившиеся области (по умолчанию)
+                                       full  — весь кадр каждый раз
+                                       off   — ничего, замер одного лишь захвата
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
 
-    spike --source dda --motion still --seconds 60     статичный рабочий стол
-    spike --source dda --seconds 60                    прокрутка документа (крутить вручную)
+    spike --source dda --seconds 60                    статичный стол: не трогать мышь
+    spike --source dda --seconds 60                    прокрутка: крутить документ вручную
     spike --source synthetic --motion scroll           проверка стенда без настоящего экрана
+
+Сравнение путей копирования — два прогона подряд, одинаково крутя документ:
+
+    spike --readback full --seconds 30
+    spike --readback dirty --seconds 30
 "
 }
 
@@ -164,7 +172,14 @@ fn parse_args() -> Result<Args, String> {
                 args.width = w.trim().parse().map_err(|_| "ширина не число")?;
                 args.height = h.trim().parse().map_err(|_| "высота не число")?;
             }
-            "--no-readback" => args.readback = false,
+            "--readback" => {
+                let v = value()?;
+                args.readback =
+                    Readback::parse(&v).ok_or(format!("неизвестный режим копирования: {v}"))?;
+            }
+            // Kept as an alias: it was in the first version of the harness and
+            // in the notes people are working from.
+            "--no-readback" => args.readback = Readback::Off,
             other => return Err(format!("неизвестный ключ: {other}")),
         }
     }
@@ -258,10 +273,14 @@ fn main() {
     }
     println!();
     println!(
-        "Прогон {} с при цели {} к/с, копирование пикселей {}.",
+        "Прогон {} с при цели {} к/с, копирование: {}.",
         args.seconds,
         args.fps,
-        if args.readback { "включено" } else { "выключено" }
+        match args.readback {
+            Readback::Off => "выключено",
+            Readback::Full => "весь кадр",
+            Readback::Dirty => "только изменившиеся области",
+        }
     );
     if matches!(args.source.as_str(), "dda" | "auto") {
         println!("Не трогайте мышь, если меряете статичный стол; крутите документ, если прокрутку.");
@@ -285,6 +304,7 @@ fn main() {
                     is_new: true,
                     changed_px: frame.dirty.area(frame.width, frame.height),
                     dirty_rects: frame.dirty.count(),
+                    copied_px: frame.copied_px,
                     // Encoding is wired in the second pass, once libvpx builds on
                     // the target. The accounting for it is already in place.
                     encode_us: None,

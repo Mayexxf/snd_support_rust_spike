@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{CaptureError, Dirty, Frame, FrameSource, Rect};
+use crate::{CaptureError, Dirty, Frame, FrameSource, Readback, Rect};
 
 /// How much of the fake desktop moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +130,7 @@ impl FrameSource for SyntheticSource {
     fn next_frame(
         &mut self,
         timeout: Duration,
-        readback: bool,
+        readback: Readback,
     ) -> Result<Option<Frame<'_>>, CaptureError> {
         let rects = self.dirty_for(self.frame_no);
 
@@ -158,24 +158,33 @@ impl FrameSource for SyntheticSource {
         // Painting is this source's stand-in for a readback: it is the stage that
         // moves a frame's worth of bytes through memory. Timed as such, and named
         // as such in the report, so nobody reads it as a GPU measurement.
+        //
+        // The full/dirty distinction is honoured here too, so the two paths can
+        // be compared on a machine with no real desktop to capture.
+        let full = [Rect { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 }];
+        let painted: &[Rect] = match readback {
+            Readback::Off => &[],
+            Readback::Full => &full,
+            Readback::Dirty => &rects,
+        };
         let paint_start = Instant::now();
-        if readback {
-            self.paint(&rects);
-        }
+        self.paint(painted);
         let painted_us = paint_start.elapsed().as_micros() as u64;
+        let copied_px = painted.iter().map(Rect::area).sum();
         self.frame_no += 1;
 
         Ok(Some(Frame {
             width: self.width,
             height: self.height,
             stride: self.width as usize * 4,
-            bgra: readback.then_some(self.buf.as_slice()),
+            bgra: readback.wants_pixels().then_some(self.buf.as_slice()),
             dirty: Dirty::Rects(rects),
             wait_us: waited.as_micros() as u64,
             // No GPU is involved, so there is no capture work beyond producing
             // the rectangles, which is free here.
             work_us: 0,
             readback_us: painted_us,
+            copied_px,
         }))
     }
 
@@ -193,7 +202,7 @@ mod tests {
     #[test]
     fn first_frame_is_always_a_full_repaint() {
         let mut src = SyntheticSource::new(640, 480, Motion::Still, 30);
-        let frame = src.next_frame(Duration::from_millis(50), true).unwrap().unwrap();
+        let frame = src.next_frame(Duration::from_millis(50), Readback::Dirty).unwrap().unwrap();
         assert_eq!(frame.dirty.area(640, 480), 640 * 480);
         assert_eq!(frame.bgra.map(<[u8]>::len), Some(640 * 480 * 4));
     }
@@ -201,11 +210,11 @@ mod tests {
     #[test]
     fn a_still_screen_reports_no_new_frame() {
         let mut src = SyntheticSource::new(320, 240, Motion::Still, 60);
-        assert!(src.next_frame(Duration::from_millis(5), false).unwrap().is_some());
+        assert!(src.next_frame(Duration::from_millis(5), Readback::Off).unwrap().is_some());
         // Every later poll must come back empty — this is the path that produces
         // the "экран не менялся" share, the number the encoding budget rests on.
         for _ in 0..3 {
-            assert!(src.next_frame(Duration::from_millis(1), false).unwrap().is_none());
+            assert!(src.next_frame(Duration::from_millis(1), Readback::Off).unwrap().is_none());
         }
     }
 
@@ -215,13 +224,13 @@ mod tests {
         let full = u64::from(w) * u64::from(h);
 
         let mut cursor = SyntheticSource::new(w, h, Motion::Cursor, 240);
-        cursor.next_frame(Duration::from_millis(20), false).unwrap();
-        let f = cursor.next_frame(Duration::from_millis(20), false).unwrap().unwrap();
+        cursor.next_frame(Duration::from_millis(20), Readback::Off).unwrap();
+        let f = cursor.next_frame(Duration::from_millis(20), Readback::Off).unwrap().unwrap();
         assert_eq!(f.dirty.area(w, h), 32 * 32);
 
         let mut scroll = SyntheticSource::new(w, h, Motion::Scroll, 240);
-        scroll.next_frame(Duration::from_millis(20), false).unwrap();
-        let f = scroll.next_frame(Duration::from_millis(20), false).unwrap().unwrap();
+        scroll.next_frame(Duration::from_millis(20), Readback::Off).unwrap();
+        let f = scroll.next_frame(Duration::from_millis(20), Readback::Off).unwrap().unwrap();
         let share = f.dirty.area(w, h) as f64 / full as f64;
         assert!((0.55..0.65).contains(&share), "доля {share}");
     }
@@ -229,15 +238,15 @@ mod tests {
     #[test]
     fn readback_off_returns_no_pixels() {
         let mut src = SyntheticSource::new(64, 64, Motion::Full, 60);
-        let f = src.next_frame(Duration::from_millis(20), false).unwrap().unwrap();
+        let f = src.next_frame(Duration::from_millis(20), Readback::Off).unwrap().unwrap();
         assert!(f.bgra.is_none());
     }
 
     #[test]
     fn painting_actually_writes_the_dirty_region() {
         let mut src = SyntheticSource::new(64, 64, Motion::Full, 240);
-        src.next_frame(Duration::from_millis(20), true).unwrap();
-        let f = src.next_frame(Duration::from_millis(20), true).unwrap().unwrap();
+        src.next_frame(Duration::from_millis(20), Readback::Full).unwrap();
+        let f = src.next_frame(Duration::from_millis(20), Readback::Full).unwrap().unwrap();
         let px = f.bgra.unwrap();
         // Alpha is written opaque everywhere the painter touched.
         assert!(px.chunks_exact(4).all(|p| p[3] == 0xFF));
@@ -246,11 +255,11 @@ mod tests {
     #[test]
     fn reinit_restarts_from_a_full_frame() {
         let mut src = SyntheticSource::new(128, 128, Motion::Still, 60);
-        src.next_frame(Duration::from_millis(5), false).unwrap();
-        assert!(src.next_frame(Duration::from_millis(1), false).unwrap().is_none());
+        src.next_frame(Duration::from_millis(5), Readback::Off).unwrap();
+        assert!(src.next_frame(Duration::from_millis(1), Readback::Off).unwrap().is_none());
 
         src.reinit().unwrap();
-        let f = src.next_frame(Duration::from_millis(5), false).unwrap().unwrap();
+        let f = src.next_frame(Duration::from_millis(5), Readback::Off).unwrap().unwrap();
         assert_eq!(f.dirty.area(128, 128), 128 * 128);
     }
 }

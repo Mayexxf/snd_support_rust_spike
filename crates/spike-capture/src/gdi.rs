@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-use crate::{CaptureError, Dirty, Frame, FrameSource};
+use crate::{CaptureError, Dirty, Frame, FrameSource, Readback};
 
 pub struct GdiSource {
     screen: HDC,
@@ -109,7 +109,7 @@ impl FrameSource for GdiSource {
     fn next_frame(
         &mut self,
         timeout: Duration,
-        readback: bool,
+        readback: Readback,
     ) -> Result<Option<Frame<'_>>, CaptureError> {
         // GDI has no notion of "wait until something changes", so the pacing is
         // ours to do. Without it the runner spins at whatever rate BitBlt manages
@@ -140,7 +140,7 @@ impl FrameSource for GdiSource {
         }
         let work_us = work_start.elapsed().as_micros() as u64;
 
-        let readback_us = if readback {
+        let readback_us = if readback.wants_pixels() {
             let started = Instant::now();
             let mut info = BITMAPINFO::default();
             info.bmiHeader = BITMAPINFOHEADER {
@@ -181,12 +181,27 @@ impl FrameSource for GdiSource {
             width: self.width as u32,
             height: self.height as u32,
             stride: self.width as usize * 4,
-            bgra: readback.then_some(self.buf.as_slice()),
+            bgra: readback.wants_pixels().then_some(self.buf.as_slice()),
             dirty: Dirty::Unknown,
             wait_us: waited.as_micros() as u64,
             work_us,
             readback_us,
+            // GDI reports no change information, so there is nothing partial to
+            // do: `Readback::Dirty` gets the same full copy as `Full`, and the
+            // count says so rather than flattering the backend.
+            copied_px: if readback.wants_pixels() {
+                self.width as u64 * self.height as u64
+            } else {
+                0
+            },
         }))
+    }
+
+    fn caveats(&self) -> Vec<String> {
+        vec![
+            "GDI не сообщает изменившиеся области — частичное копирование здесь              невозможно, каждый кадр копируется целиком"
+                .to_owned(),
+        ]
     }
 
     fn reinit(&mut self) -> Result<(), CaptureError> {

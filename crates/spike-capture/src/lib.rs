@@ -71,6 +71,43 @@ impl Dirty {
     }
 }
 
+/// How much of the frame to move out of GPU memory.
+///
+/// Selectable rather than fixed because the first Windows run made the question
+/// worth measuring: capture work cost 0.1 ms and the copy cost 6.9 ms, while the
+/// same run reported that only 27% of the screen had changed. Three quarters of
+/// every copy was being thrown away.
+///
+/// Whether copying the changed regions instead is actually faster is not
+/// obvious — many small transfers can lose to one large one, and drivers
+/// optimise the whole-resource path. So both paths stay in the harness and the
+/// target machine decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Readback {
+    /// Do not touch the pixels. Measures capture alone.
+    Off,
+    /// Copy the whole frame every time.
+    Full,
+    /// Copy only the regions the backend reported as changed.
+    #[default]
+    Dirty,
+}
+
+impl Readback {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => Readback::Off,
+            "full" => Readback::Full,
+            "dirty" => Readback::Dirty,
+            _ => return None,
+        })
+    }
+
+    pub fn wants_pixels(self) -> bool {
+        self != Readback::Off
+    }
+}
+
 /// One captured frame. Borrows the source's readback buffer.
 #[derive(Debug)]
 pub struct Frame<'a> {
@@ -93,6 +130,13 @@ pub struct Frame<'a> {
     pub work_us: u64,
     /// Microseconds spent copying pixels out of GPU memory into system memory.
     pub readback_us: u64,
+    /// Pixels actually moved this frame.
+    ///
+    /// Reported separately from `dirty` because they are not the same number:
+    /// a backend may be asked for the changed regions and still copy everything,
+    /// either because it cannot do better or because the frame was the first
+    /// after a reset. This is what was really paid for.
+    pub copied_px: u64,
 }
 
 #[derive(Debug)]
@@ -129,7 +173,7 @@ pub trait FrameSource {
     fn next_frame(
         &mut self,
         timeout: Duration,
-        readback: bool,
+        readback: Readback,
     ) -> Result<Option<Frame<'_>>, CaptureError>;
 
     /// Rebuild after [`CaptureError::AccessLost`].
@@ -162,6 +206,19 @@ mod tests {
     fn unknown_dirty_counts_as_the_whole_screen() {
         assert_eq!(Dirty::Unknown.area(1920, 1080), 1920 * 1080);
         assert_eq!(Dirty::Unknown.count(), 1);
+    }
+
+    #[test]
+    fn readback_modes_parse_and_off_means_no_pixels() {
+        assert_eq!(Readback::parse("dirty"), Some(Readback::Dirty));
+        assert_eq!(Readback::parse("full"), Some(Readback::Full));
+        assert_eq!(Readback::parse("off"), Some(Readback::Off));
+        assert_eq!(Readback::parse("частично"), None);
+        assert!(!Readback::Off.wants_pixels());
+        assert!(Readback::Full.wants_pixels());
+        assert!(Readback::Dirty.wants_pixels());
+        // Dirty is the default: it is the path the product would ship.
+        assert_eq!(Readback::default(), Readback::Dirty);
     }
 
     #[test]

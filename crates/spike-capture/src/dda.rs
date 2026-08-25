@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
-use crate::{CaptureError, Dirty, Frame, FrameSource, Rect};
+use crate::{CaptureError, Dirty, Frame, FrameSource, Readback, Rect};
 
 pub struct DdaSource {
     device: ID3D11Device,
@@ -54,6 +54,14 @@ pub struct DdaSource {
     dirty: Vec<Rect>,
     buf: Vec<u8>,
     stride: usize,
+    /// The CPU-side buffer holds nothing trustworthy yet.
+    ///
+    /// Partial copies only update what changed and rely on the rest of the
+    /// buffer still holding the previous frame. Right after opening, resizing or
+    /// reinitialising there is no previous frame, so the next copy has to be a
+    /// full one however the caller asked. Without this the first frame after a
+    /// UAC prompt would be three quarters uninitialised memory.
+    force_full: bool,
 }
 
 impl DdaSource {
@@ -136,6 +144,7 @@ impl DdaSource {
                 dirty: Vec::new(),
                 buf: Vec::new(),
                 stride: 0,
+                force_full: true,
             })
         }
     }
@@ -189,8 +198,15 @@ impl DdaSource {
         Dirty::Rects(std::mem::take(&mut self.dirty))
     }
 
-    /// Copy the frame out of GPU memory. Returns microseconds spent.
-    unsafe fn readback(&mut self, resource: &IDXGIResource) -> Result<u64, CaptureError> {
+    /// Copy the frame out of GPU memory.
+    ///
+    /// Returns microseconds spent and pixels actually moved.
+    unsafe fn readback(
+        &mut self,
+        resource: &IDXGIResource,
+        mode: Readback,
+        dirty: &Dirty,
+    ) -> Result<(u64, u64), CaptureError> {
         let started = Instant::now();
 
         let src: ID3D11Texture2D = resource
@@ -231,22 +247,77 @@ impl DdaSource {
             self.staging = tex;
             self.width = desc.Width;
             self.height = desc.Height;
+            // A new staging texture and a resized CPU buffer share nothing with
+            // the previous frame.
+            self.force_full = true;
         }
 
         let staging = self
             .staging
             .as_ref()
-            .ok_or_else(|| CaptureError::Failed("staging-текстура отсутствует".into()))?;
+            .ok_or_else(|| CaptureError::Failed("staging-текстура отсутствует".into()))?
+            .clone();
 
-        // SAFETY: both textures are live and share a description.
-        unsafe { self.context.CopyResource(staging, &src) };
+        // Regions to move. `Dirty::Unknown` means the driver told us nothing, so
+        // the honest answer is the whole screen rather than an empty list.
+        let rects: Vec<Rect> = match (mode, dirty, self.force_full) {
+            (Readback::Dirty, Dirty::Rects(r), false) => r
+                .iter()
+                .map(|r| clamp(*r, desc.Width, desc.Height))
+                .filter(|r| r.area() > 0)
+                .collect(),
+            _ => vec![Rect {
+                left: 0,
+                top: 0,
+                right: desc.Width as i32,
+                bottom: desc.Height as i32,
+            }],
+        };
+
+        let full_frame = rects.len() == 1
+            && rects[0].left == 0
+            && rects[0].top == 0
+            && rects[0].right == desc.Width as i32
+            && rects[0].bottom == desc.Height as i32;
+
+        if full_frame {
+            // SAFETY: both textures are live and share a description.
+            unsafe { self.context.CopyResource(&staging, &src) };
+        } else {
+            for r in &rects {
+                let box_ = D3D11_BOX {
+                    left: r.left as u32,
+                    top: r.top as u32,
+                    front: 0,
+                    right: r.right as u32,
+                    bottom: r.bottom as u32,
+                    back: 1,
+                };
+                // Destination coordinates match the source: the staging texture
+                // keeps a full-frame image that is patched in place, which is
+                // what makes a partial copy legal at all.
+                // SAFETY: the box is clamped to the source dimensions above and
+                // both resources share a format.
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        &staging,
+                        0,
+                        r.left as u32,
+                        r.top as u32,
+                        0,
+                        &src,
+                        0,
+                        Some(&box_),
+                    );
+                }
+            }
+        }
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: `mapped` is live; the matching Unmap runs before returning on
-        // every path below.
+        // SAFETY: `mapped` is live; the matching Unmap runs before returning.
         unsafe {
             self.context
-                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|e| CaptureError::Failed(format!("Map: {e}")))?;
         }
 
@@ -257,23 +328,47 @@ impl DdaSource {
             self.buf.resize(total, 0);
         }
 
-        // SAFETY: the mapped region holds `RowPitch * Height` readable bytes;
-        // we copy `row_bytes <= RowPitch` from each row. RowPitch is often larger
-        // than width*4 — copying it wholesale would misalign every row.
-        unsafe {
+        // SAFETY: the mapped region holds `RowPitch * Height` readable bytes, and
+        // every row range below is clamped to the texture. RowPitch is often
+        // larger than width*4 — copying it wholesale would misalign every row.
+        let copied_px = unsafe {
             let src_ptr = mapped.pData as *const u8;
             let pitch = mapped.RowPitch as usize;
-            for y in 0..desc.Height as usize {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(y * pitch),
-                    self.buf.as_mut_ptr().add(y * row_bytes),
-                    row_bytes,
-                );
+            let mut px = 0u64;
+            for r in &rects {
+                let x0 = r.left as usize * 4;
+                let span = (r.right - r.left) as usize * 4;
+                for y in r.top as usize..r.bottom as usize {
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(y * pitch + x0),
+                        self.buf.as_mut_ptr().add(y * row_bytes + x0),
+                        span,
+                    );
+                }
+                px += r.area();
             }
-            self.context.Unmap(staging, 0);
-        }
+            px
+        };
 
-        Ok(started.elapsed().as_micros() as u64)
+        // SAFETY: matches the successful Map above.
+        unsafe { self.context.Unmap(&staging, 0) };
+
+        self.force_full = false;
+        Ok((started.elapsed().as_micros() as u64, copied_px))
+    }
+}
+
+/// Clip a reported rectangle to the texture.
+///
+/// Cheap insurance rather than a known defect: the driver supplies these, a
+/// rectangle reaching one pixel past the edge would read out of bounds, and the
+/// cost of checking is nothing next to the cost of finding out.
+fn clamp(r: Rect, width: u32, height: u32) -> Rect {
+    Rect {
+        left: r.left.clamp(0, width as i32),
+        top: r.top.clamp(0, height as i32),
+        right: r.right.clamp(0, width as i32),
+        bottom: r.bottom.clamp(0, height as i32),
     }
 }
 
@@ -292,7 +387,7 @@ impl FrameSource for DdaSource {
     fn next_frame(
         &mut self,
         timeout: Duration,
-        readback: bool,
+        readback: Readback,
     ) -> Result<Option<Frame<'_>>, CaptureError> {
         let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -327,11 +422,11 @@ impl FrameSource for DdaSource {
         // SAFETY: called while a frame is held.
         let dirty = unsafe { self.read_dirty(&info) };
 
-        let readback_us = if readback {
+        let (readback_us, copied_px) = if readback.wants_pixels() {
             match resource.as_ref() {
                 Some(res) => {
                     // SAFETY: the resource is valid until ReleaseFrame below.
-                    let r = unsafe { self.readback(res) };
+                    let r = unsafe { self.readback(res, readback, &dirty) };
                     // Release before propagating: leaking the frame would wedge
                     // every later AcquireNextFrame with ACCESS_DENIED.
                     // SAFETY: a frame is held.
@@ -347,7 +442,7 @@ impl FrameSource for DdaSource {
         } else {
             // SAFETY: a frame is held.
             let _ = unsafe { dupl.ReleaseFrame() };
-            0
+            (0, 0)
         };
 
         let work_us = work_start
@@ -359,11 +454,13 @@ impl FrameSource for DdaSource {
             width: self.width,
             height: self.height,
             stride: self.stride,
-            bgra: (readback && !self.buf.is_empty()).then_some(self.buf.as_slice()),
+            bgra: (readback.wants_pixels() && !self.buf.is_empty())
+                .then_some(self.buf.as_slice()),
             dirty,
             wait_us,
             work_us,
             readback_us,
+            copied_px,
         }))
     }
 
@@ -409,6 +506,9 @@ impl FrameSource for DdaSource {
         // texture is thrown away rather than trusted to still match.
         self.staging = None;
         self.buf.clear();
+        // Nothing in the CPU buffer survives a reinitialisation, so the next
+        // copy must be a full one whatever the caller asks for.
+        self.force_full = true;
         Ok(())
     }
 }

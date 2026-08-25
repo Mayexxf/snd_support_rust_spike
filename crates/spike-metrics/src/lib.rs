@@ -111,6 +111,11 @@ pub struct FrameStat {
     pub changed_px: u64,
     /// Number of dirty rectangles the capture API reported.
     pub dirty_rects: u32,
+    /// Pixels actually moved out of GPU memory this frame.
+    ///
+    /// Not the same as `changed_px`: the point of tracking both is to see how
+    /// much of the reported change the copy path managed to skip.
+    pub copied_px: u64,
     /// Encode time, when an encoder is wired in.
     pub encode_us: Option<u64>,
     /// Size of the encoded frame in bytes.
@@ -135,6 +140,7 @@ pub struct Recorder {
     frames_new: u64,
     keyframes: u64,
     changed_px_total: u128,
+    copied_px_total: u128,
     dirty_rects_total: u64,
     encoded_bytes_total: u128,
     keyframe_bytes_total: u128,
@@ -161,6 +167,7 @@ impl Recorder {
             frames_new: 0,
             keyframes: 0,
             changed_px_total: 0,
+            copied_px_total: 0,
             dirty_rects_total: 0,
             encoded_bytes_total: 0,
             keyframe_bytes_total: 0,
@@ -193,6 +200,7 @@ impl Recorder {
                 + stat.encode_us.unwrap_or(0),
         );
         self.changed_px_total += stat.changed_px as u128;
+        self.copied_px_total += stat.copied_px as u128;
         self.dirty_rects_total += stat.dirty_rects as u64;
         if let Some(us) = stat.encode_us {
             self.encode.push(us);
@@ -239,6 +247,7 @@ impl Recorder {
             frames_new: self.frames_new,
             keyframes: self.keyframes,
             changed_px_total: self.changed_px_total,
+            copied_px_total: self.copied_px_total,
             dirty_rects_total: self.dirty_rects_total,
             encoded_bytes_total: self.encoded_bytes_total,
             keyframe_bytes_total: self.keyframe_bytes_total,
@@ -268,6 +277,7 @@ pub struct Report {
     pub frames_new: u64,
     pub keyframes: u64,
     pub changed_px_total: u128,
+    pub copied_px_total: u128,
     pub dirty_rects_total: u64,
     pub encoded_bytes_total: u128,
     pub keyframe_bytes_total: u128,
@@ -307,6 +317,19 @@ impl Report {
             return 0.0;
         }
         (self.changed_px_total as f64 / self.frames_new as f64) / px as f64
+    }
+
+    /// Mean share of the screen actually copied, per frame that carried content.
+    ///
+    /// Read against [`Report::mean_changed_share`]: if copying is doing its job
+    /// the two are close, and if it is copying everything regardless this one
+    /// sits at 100% while the other does not.
+    pub fn mean_copied_share(&self) -> f64 {
+        let px = u128::from(self.width) * u128::from(self.height);
+        if self.frames_new == 0 || px == 0 {
+            return 0.0;
+        }
+        (self.copied_px_total as f64 / self.frames_new as f64) / px as f64
     }
 
     /// Average bitrate over the whole run, in megabits per second.
@@ -445,6 +468,13 @@ impl std::fmt::Display for Report {
                 "  менялось за кадр        {:.2}% площади, прямоугольников в среднем {:.1}",
                 self.mean_changed_share() * 100.0,
                 self.dirty_rects_total as f64 / self.frames_new as f64
+            )?;
+        }
+        if self.frames_new > 0 && self.copied_px_total > 0 {
+            writeln!(
+                s,
+                "  копировалось за кадр    {:.2}% площади",
+                self.mean_copied_share() * 100.0
             )?;
         }
         if self.access_lost > 0 || self.reinits > 0 {
@@ -682,6 +712,24 @@ mod tests {
         // an invented answer to the question phase 0 exists to ask.
         assert!(rep.verdict().is_none());
         let _ = rep.to_string();
+    }
+
+    #[test]
+    fn copied_and_changed_are_tracked_apart() {
+        // A backend asked for partial copies but unable to do them reports the
+        // full screen copied against a fraction changed. That gap is the whole
+        // point of the measurement, so it must not be averaged away.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        r.record(&FrameStat {
+            is_new: true,
+            changed_px: 2_500,
+            copied_px: 10_000,
+            ..Default::default()
+        });
+        let rep = r.finish(Duration::from_secs(1));
+        assert!((rep.mean_changed_share() - 0.25).abs() < 1e-9);
+        assert!((rep.mean_copied_share() - 1.0).abs() < 1e-9);
+        assert!(rep.to_string().contains("копировалось за кадр"));
     }
 
     #[test]
