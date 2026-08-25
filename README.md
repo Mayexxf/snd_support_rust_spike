@@ -64,21 +64,70 @@ C-рантайм (`+crt-static`), и `-static-md` — сборка под дин
 winget install LLVM.LLVM
 ```
 
-LLVM нужен bindgen'у. vcpkg отдаёт libvpx 1.16.0, а готовые биндинги в
-`env-libvpx-sys` заканчиваются на 1.13.0 — так что биндинги генерируются по
-настоящим заголовкам. Это надёжнее, а не хуже: расхождение ABI не выдало бы
+LLVM нужен bindgen'у, и обойтись без него не выйдет ни одним из путей: готовые
+биндинги в `env-libvpx-sys` заканчиваются на 1.13.0, vcpkg даёт 1.16.0, а
+ShiftMediaProject — 1.15.1. Биндинги генерируются по настоящим заголовкам. Это надёжнее, а не хуже: расхождение ABI не выдало бы
 ошибку сборки, оно испортило бы память и напечатало правдоподобные числа.
+
+### Если vcpkg не может скачать msys2
+
+vcpkg собирает libvpx из исходников и тянет для этого msys2, nasm и perl.
+`curl error 6 (Could not resolve hostname)` — это отказ DNS, а не медленная сеть,
+и он бывает разовым: vcpkg считает такую ошибку невосстановимой и не повторяет
+попытку, хотя имя разрешилось бы секундой позже. Сначала проверьте DNS и просто
+запустите установку заново.
+
+```powershell
+nslookup repo.msys2.org
+```
+
+Если зеркала недоступны принципиально, libvpx берётся готовой —
+[ShiftMediaProject/libvpx](https://github.com/ShiftMediaProject/libvpx/releases),
+файл `libvpx_v1.15.1_msvc17.zip` (msvc17 — это Visual Studio 2022). Ни msys2, ни
+nasm, ни perl тогда не нужны: распаковать и указать пути. Заголовки лежат в
+`include/vpx/`, статическая библиотека — в `lib/x64/libvpx.lib`, именно под тем
+именем, которое ищет `env-libvpx-sys`. Соседний `lib/x64/vpx.lib` — библиотека
+импорта для DLL, она не нужна.
+
+**У этого пути есть цена, и она не косметическая.** Готовая сборка собрана с
+динамическим C-рантаймом: в `libvpx.lib` 235 директив `DEFAULTLIB:"MSVCRT"`. Наш
+`+crt-static` — статический рантайм, и компоновщик ответит `LNK2038: mismatch
+detected for RuntimeLibrary`.
+
+Чтобы собралось, придётся убрать `+crt-static` из `.cargo/config.toml`. Правьте
+файл руками, а не через `RUSTFLAGS`: переменная окружения **заменяет** флаги из
+конфига целиком, и вместе с `+crt-static` тихо исчезнет `target-cpu=x86-64` — тот
+самый флаг, без которого бинарь умирает на Celeron с `0xc000001d` до первой
+записи в лог.
+
+Последствие: бинарю понадобится Visual C++ Redistributable на целевой машине. На
+заброшенной старой машине его может не быть, и тогда приложение не запустится
+вовсе. Для замерочного стенда это терпимо — поставьте redist заодно, — но для
+продукта правильным остаётся путь через vcpkg с триплетом `x64-windows-static`.
 
 ### Переменные окружения
 
+Через vcpkg:
+
 ```powershell
-$vcpkg = "C:\vcpkg\installed\x64-windows-static"
-$env:VPX_LIB_DIR = "$vcpkg\lib"
-$env:VPX_INCLUDE_DIR = "$vcpkg\include"
-$env:VPX_VERSION = "1.16.0"
-$env:VPX_STATIC = "1"
+$sdk = "C:\vcpkg\installed\x64-windows-static"
+$env:VPX_LIB_DIR = "$sdk\lib"; $env:VPX_INCLUDE_DIR = "$sdk\include"
+$env:VPX_VERSION = "1.16.0"; $env:VPX_STATIC = "1"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 ```
+
+Через готовую сборку — свой каталог распаковки и версия из имени архива:
+
+```powershell
+$sdk = "C:\libvpx"
+$env:VPX_LIB_DIR = "$sdk\lib\x64"; $env:VPX_INCLUDE_DIR = "$sdk\include"
+$env:VPX_VERSION = "1.15.1"; $env:VPX_STATIC = "1"
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+```
+
+`VPX_VERSION` обязана совпадать с тем, что стоит: она уходит в проверку ABI при
+инициализации кодера. У 1.13 эта версия равна 30, у 1.15 — 37, и несовпадение
+libvpx поймает сама.
 
 ### Сборка и прогон
 
