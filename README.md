@@ -139,6 +139,37 @@ $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 инициализации кодера. У 1.13 эта версия равна 30, у 1.15 — 37, и несовпадение
 libvpx поймает сама.
 
+### Если сборка падает на «no field `g_w` on type `vpx_codec_enc_cfg`»
+
+Пятнадцать ошибок про неизвестные поля и подсказка `available field is:
+_address` означают одно: bindgen не нашёл заголовки libvpx. Он при этом **не
+падает** — выдаёт неполные типы и позволяет сборке дойти до места, где они
+используются. Причина всегда в путях, а не в коде.
+
+Сборочный скрипт `spike-encode` проверяет настройку заранее и печатает, чего
+именно не хватает. Проверить руками:
+
+```powershell
+Get-ChildItem "$env:VPX_INCLUDE_DIR\vpx\vpx_encoder.h"
+```
+
+`VPX_INCLUDE_DIR` указывает на каталог, **внутри** которого лежит подкаталог
+`vpx\` — то есть `C:\libvpx\include`, а не `C:\libvpx\include\vpx`.
+Проверьте заодно, не создал ли распаковщик лишний уровень вложенности вида
+`C:\libvpx\libvpx_v1.15.1_msvc17\include`.
+
+Если пути верны, а типы всё равно пустые — clang не нашёл **системные заголовки
+Windows**: `vpx_integer.h` включает `<stdint.h>`, и libclang вне окружения
+Visual Studio до него не дотягивается. Собирайте из **Developer PowerShell for
+VS 2022** — переменные окружения libvpx придётся задать в ней заново.
+
+Увидеть, на что жалуется clang, можно так — вывод сборочных скриптов иначе
+скрыт:
+
+```powershell
+cargo build --release --features vpx --config .cargo\dynamic-crt.toml -vv 2>&1 | Select-String -Pattern "clang|fatal|error" | Select-Object -First 30
+```
+
 ### Сборка и прогон
 
 ```powershell
