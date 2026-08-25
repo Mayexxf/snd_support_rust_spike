@@ -12,7 +12,8 @@
 
 use std::time::{Duration, Instant};
 
-use spike_capture::{CaptureError, FrameSource, Readback, synthetic};
+use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, synthetic};
+use spike_encode::{Codec, convert::I420};
 use spike_metrics::{FrameStat, Recorder, env::Machine};
 
 const DEFAULT_SECONDS: u64 = 30;
@@ -94,6 +95,8 @@ struct Args {
     width: u32,
     height: u32,
     readback: Readback,
+    codec: Codec,
+    bitrate_kbps: u32,
 }
 
 impl Default for Args {
@@ -109,6 +112,8 @@ impl Default for Args {
             width: 1920,
             height: 1080,
             readback: Readback::default(),
+            codec: Codec::default(),
+            bitrate_kbps: 2_000,
         }
     }
 }
@@ -129,6 +134,8 @@ fn usage() -> &'static str {
                                        full    — весь кадр каждый раз
                                        compare — оба пути на одном кадре, с замером
                                        off     — ничего, замер одного лишь захвата
+    --encode <none|vp8|vp9>            кодировать кадры (нужна сборка --features vpx)
+    --bitrate <кбит/с>                 целевой битрейт, по умолчанию 2000
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -180,6 +187,13 @@ fn parse_args() -> Result<Args, String> {
             // Kept as an alias: it was in the first version of the harness and
             // in the notes people are working from.
             "--no-readback" => args.readback = Readback::Off,
+            "--encode" => {
+                let v = value()?;
+                args.codec = Codec::parse(&v).ok_or(format!("неизвестный кодек: {v}"))?;
+            }
+            "--bitrate" => {
+                args.bitrate_kbps = value()?.parse().map_err(|_| "--bitrate ждёт число")?;
+            }
             other => return Err(format!("неизвестный ключ: {other}")),
         }
     }
@@ -240,6 +254,56 @@ fn open_gdi() -> Result<Box<dyn FrameSource>, CaptureError> {
     Err(CaptureError::Unavailable("только Windows".to_owned()))
 }
 
+/// Build the encoder, or explain why there is none.
+///
+/// Returns `Ok(None)` when no encoding was asked for. An explicit request that
+/// cannot be honoured is an error, not a silent downgrade: a run that quietly
+/// skipped encoding would print a comfortable budget and answer nothing.
+#[cfg(feature = "vpx")]
+fn build_encoder(
+    args: &Args,
+    width: u32,
+    height: u32,
+) -> Result<Option<spike_encode::vpx::VpxEncoder>, String> {
+    use spike_encode::vpx::{Settings, VpxEncoder};
+    if args.codec == Codec::None {
+        return Ok(None);
+    }
+    let mut settings = Settings::new(width, height, args.fps);
+    settings.bitrate_kbps = args.bitrate_kbps;
+    VpxEncoder::new(args.codec, settings).map(Some)
+}
+
+#[cfg(not(feature = "vpx"))]
+fn build_encoder(args: &Args, _width: u32, _height: u32) -> Result<Option<Never>, String> {
+    if args.codec == Codec::None {
+        return Ok(None);
+    }
+    Err(format!(
+        "стенд собран без libvpx, кодировать {} нечем.\n\
+         Пересоберите с --features vpx (нужны vcpkg, libvpx и LLVM — см. README)",
+        args.codec.name()
+    ))
+}
+
+/// Stand-in for the encoder type when the feature is off, so the call sites
+/// stay identical instead of sprouting cfg blocks.
+#[cfg(not(feature = "vpx"))]
+enum Never {}
+
+#[cfg(feature = "vpx")]
+fn encode_one(
+    enc: &mut spike_encode::vpx::VpxEncoder,
+    yuv: &I420,
+) -> Result<spike_encode::Encoded, String> {
+    enc.encode(yuv)
+}
+
+#[cfg(not(feature = "vpx"))]
+fn encode_one(enc: &mut Never, _yuv: &I420) -> Result<spike_encode::Encoded, String> {
+    match *enc {}
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -289,6 +353,31 @@ fn main() {
     }
     println!();
 
+    let mut encoder = match build_encoder(&args, w, h) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(1);
+        }
+    };
+    if args.codec != Codec::None {
+        if !args.readback.wants_pixels() {
+            eprintln!("\nОшибка: кодировать нечего — копирование пикселей выключено.");
+            std::process::exit(2);
+        }
+        println!(
+            "Кодирование: {} при {} кбит/с.",
+            args.codec.name(),
+            args.bitrate_kbps
+        );
+    }
+
+    // The YUV frame persists between frames for the same reason the BGRA buffer
+    // does: conversion only touches what changed, so everything else has to
+    // still hold the previous frame.
+    let mut yuv = I420::new(w, h);
+    let mut first_frame = true;
+
     let mut rec = Recorder::new(format!("Захват · {}", source.describe()), w, h, args.fps);
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     // One frame interval, so a still screen blocks instead of spinning.
@@ -299,6 +388,40 @@ fn main() {
         let t0 = Instant::now();
         match source.next_frame(timeout, args.readback) {
             Ok(Some(frame)) => {
+                // Convert and encode before building the stat, so both stages
+                // are timed inside the frame they belong to.
+                let mut convert_us = 0;
+                let mut encoded = None;
+                if let Some(bgra) = frame.bgra {
+                    let whole = Rect {
+                        left: 0,
+                        top: 0,
+                        right: frame.width as i32,
+                        bottom: frame.height as i32,
+                    };
+                    // The first frame has no previous frame to leave alone, and
+                    // an unknown dirty set says nothing about what is stale.
+                    let rects: &[Rect] = match (&frame.dirty, first_frame) {
+                        (Dirty::Rects(r), false) => r,
+                        _ => std::slice::from_ref(&whole),
+                    };
+                    let t = Instant::now();
+                    yuv.convert_bgra(bgra, frame.stride, rects);
+                    convert_us = t.elapsed().as_micros() as u64;
+                    first_frame = false;
+
+                    if let Some(enc) = encoder.as_mut() {
+                        let t = Instant::now();
+                        match encode_one(enc, &yuv) {
+                            Ok(out) => encoded = Some((t.elapsed().as_micros() as u64, out)),
+                            Err(e) => {
+                                eprintln!("Кодирование прекращено: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 let stat = FrameStat {
                     wait_us: frame.wait_us,
                     work_us: frame.work_us,
@@ -308,11 +431,10 @@ fn main() {
                     dirty_rects: frame.dirty.count(),
                     copied_px: frame.copied_px,
                     compare_us: frame.compare_us,
-                    // Encoding is wired in the second pass, once libvpx builds on
-                    // the target. The accounting for it is already in place.
-                    encode_us: None,
-                    encoded_bytes: None,
-                    is_keyframe: false,
+                    convert_us,
+                    encode_us: encoded.map(|(us, _)| us),
+                    encoded_bytes: encoded.map(|(_, out)| out.bytes),
+                    is_keyframe: encoded.is_some_and(|(_, out)| out.keyframe),
                 };
                 rec.record(&stat);
             }

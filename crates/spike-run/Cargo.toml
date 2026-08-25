@@ -14,6 +14,11 @@ path = "src/main.rs"
 [dependencies]
 spike-metrics.workspace = true
 spike-capture.workspace = true
+spike-encode.workspace = true
+
+[features]
+# Passed through so `cargo run --features vpx` reaches the encoder crate.
+vpx = ["spike-encode/vpx"]
 
 # timeBeginPeriod only. Windows' default timer granularity is 15.6 ms, which
 # quantises every wait and silently caps the poll rate — see `timer` in main.rs.

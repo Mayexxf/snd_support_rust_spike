@@ -98,6 +98,13 @@ pub struct FrameStat {
     pub wait_us: u64,
     /// Time doing capture work once a frame was available. A cost.
     pub work_us: u64,
+    /// Time converting BGRA to the planar YUV the encoder wants. A cost.
+    ///
+    /// Its own stage rather than part of encoding, because it is separately
+    /// optimisable — it walks only the changed regions, and a production version
+    /// would use SIMD. Hidden inside the encoder figure, a slow conversion would
+    /// look like a slow codec and send the work in the wrong direction.
+    pub convert_us: u64,
     /// Time copying pixels from GPU memory into system memory. A cost.
     ///
     /// Separate from `work_us` on purpose. On a Braswell iGPU the readback of a
@@ -136,6 +143,7 @@ pub struct Recorder {
     wait: Latencies,
     work: Latencies,
     readback: Latencies,
+    convert: Latencies,
     compare: Latencies,
     encode: Latencies,
     budget: Latencies,
@@ -164,6 +172,7 @@ impl Recorder {
             wait: Latencies::default(),
             work: Latencies::default(),
             readback: Latencies::default(),
+            convert: Latencies::default(),
             compare: Latencies::default(),
             encode: Latencies::default(),
             budget: Latencies::default(),
@@ -194,6 +203,9 @@ impl Recorder {
         if stat.readback_us > 0 {
             self.readback.push(stat.readback_us);
         }
+        if stat.convert_us > 0 {
+            self.convert.push(stat.convert_us);
+        }
         if let Some(us) = stat.compare_us {
             self.compare.push(us);
         }
@@ -204,6 +216,7 @@ impl Recorder {
         self.budget.push(
             stat.work_us
                 + stat.readback_us
+                + stat.convert_us
                 + stat.encode_us.unwrap_or(0),
         );
         self.changed_px_total += stat.changed_px as u128;
@@ -248,6 +261,7 @@ impl Recorder {
             wait: self.wait,
             work: self.work,
             readback: self.readback,
+            convert: self.convert,
             compare: self.compare,
             encode: self.encode,
             budget: self.budget,
@@ -279,6 +293,7 @@ pub struct Report {
     pub wait: Latencies,
     pub work: Latencies,
     pub readback: Latencies,
+    pub convert: Latencies,
     pub compare: Latencies,
     pub encode: Latencies,
     pub budget: Latencies,
@@ -538,6 +553,9 @@ impl std::fmt::Display for Report {
         writeln!(s, "  работа захвата       {}", self.work.summary_ms())?;
         if !self.readback.is_empty() {
             writeln!(s, "  копирование в память {}", self.readback.summary_ms())?;
+        }
+        if !self.convert.is_empty() {
+            writeln!(s, "  конвертация в YUV    {}", self.convert.summary_ms())?;
         }
         if !self.encode.is_empty() {
             writeln!(s, "  кодирование          {}", self.encode.summary_ms())?;

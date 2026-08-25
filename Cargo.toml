@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/spike-metrics", "crates/spike-capture", "crates/spike-run"]
+members = ["crates/spike-metrics", "crates/spike-capture", "crates/spike-encode", "crates/spike-run"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 spike-metrics = { path = "crates/spike-metrics" }
 spike-capture = { path = "crates/spike-capture" }
+spike-encode = { path = "crates/spike-encode" }
 
 # Measurement builds are release builds. A debug build measures the debug
 # build's speed, which is nobody's question. Kept close to the client's release
