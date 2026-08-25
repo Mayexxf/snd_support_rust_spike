@@ -13,7 +13,9 @@
 
 use std::os::raw::{c_int, c_ulong};
 
-use env_libvpx_sys as ffi;
+// The package is `env-libvpx-sys`, but its `[lib] name` is `vpx_sys` — so that
+// is what the compiler knows it by. Not a typo to be tidied back.
+use vpx_sys as ffi;
 
 use crate::convert::I420;
 use crate::{Codec, Encoded};
