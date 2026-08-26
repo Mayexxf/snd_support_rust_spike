@@ -119,6 +119,21 @@ pub struct Settings {
     pub max_quantizer: u32,
     /// Quality target for [`RcMode::Cq`]. Ignored by the other two modes.
     pub cq_level: u32,
+    /// Make the stream survive a lost frame.
+    ///
+    /// Off was hard-coded from the first commit and never named as a choice.
+    /// Off means the encoder keeps adapting its entropy contexts backwards from
+    /// the last decoded frame, so one lost packet desynchronises the decoder and
+    /// everything after it decodes to noise until the next keyframe — up to ten
+    /// seconds here, and there is no way to ask for one sooner.
+    ///
+    /// For a support tool that has to work over a mobile hotspot this is not a
+    /// setting, it is the difference between a session and a black screen. It
+    /// costs compression, and how much is the thing to measure.
+    ///
+    /// Default stays off, so every number taken before this existed still
+    /// stands.
+    pub error_resilient: bool,
 }
 
 impl Settings {
@@ -147,6 +162,7 @@ impl Settings {
             min_quantizer: 4,
             max_quantizer: 56,
             cq_level: 10,
+            error_resilient: false,
         }
     }
 }
@@ -184,7 +200,8 @@ impl VpxEncoder {
         // No lookahead. It buys compression by delaying frames, and a remote
         // session pays for that delay with the thing it is judged on.
         cfg.g_lag_in_frames = 0;
-        cfg.g_error_resilient = 0;
+        cfg.g_error_resilient =
+            if settings.error_resilient { ffi::VPX_ERROR_RESILIENT_DEFAULT } else { 0 };
         cfg.rc_end_usage = settings.rc_mode.to_ffi();
         cfg.rc_target_bitrate = settings.bitrate_kbps;
         cfg.rc_min_quantizer = settings.min_quantizer;

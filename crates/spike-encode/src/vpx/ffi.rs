@@ -57,6 +57,19 @@ pub const VPX_CQ: c_int = 2;
 pub const VPX_KF_FIXED: c_int = 0;
 pub const VPX_KF_AUTO: c_int = 1;
 
+/// `vpx_codec_enc_cfg::g_error_resilient`, "improve resiliency against losses of
+/// whole frames" (`vpx_encoder.h:140`).
+///
+/// Zero — the value this harness hard-coded — means the encoder keeps adapting
+/// its entropy contexts from the previously *decoded* frame. Lose one packet and
+/// the decoder's contexts part company with the encoder's, and every frame after
+/// it decodes to noise until the next keyframe, which here is up to ten seconds
+/// away and not requestable from outside.
+pub const VPX_ERROR_RESILIENT_DEFAULT: c_uint = 0x1;
+/// VP8 only: partitions stay independently decodable (`vpx_encoder.h:146`).
+/// Declared for completeness; VP9 ignores it.
+pub const VPX_ERROR_RESILIENT_PARTITIONS: c_uint = 0x2;
+
 // Control ids are positions in `vp8e_enc_control_id`, an enum that assigns only
 // four of its members explicitly (`VP8E_SET_ROI_MAP = 8`, `VP8E_SET_SCALEMODE
 // = 11`, `VP8E_SET_CPUUSED = 13`, `VP9E_SET_MIN_GF_INTERVAL = 48`) and lets the

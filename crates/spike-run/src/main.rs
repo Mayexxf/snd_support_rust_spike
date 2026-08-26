@@ -137,6 +137,7 @@ struct Args {
     rc_mode: String,
     min_quantizer: u32,
     max_quantizer: u32,
+    error_resilient: bool,
     cq_level: u32,
     /// Encoder configurations to measure side by side on identical frames.
     /// Empty for an ordinary single-encoder run.
@@ -174,6 +175,7 @@ impl Default for Args {
             rc_mode: "cbr".to_owned(),
             min_quantizer: 4,
             max_quantizer: 56,
+            error_resilient: false,
             cq_level: 10,
             compare: Vec::new(),
         }
@@ -185,7 +187,8 @@ impl Default for Args {
 /// Written as `vp9:s2:t4:c9:b1500` — the codec first, then any of scale (`s`),
 /// threads (`t`), cpu-used (`c`), bitrate (`b`), tile columns (`k`), row-mt
 /// (`r`), static threshold (`n`), minimum quantizer (`q`), maximum quantizer
-/// (`m`), rate control (`u`) and CQ level (`l`), in any order. Anything left out falls back to the
+/// (`m`), loss resilience (`e`), rate control (`u`) and CQ level (`l`), in any
+/// order. Anything left out falls back to the
 /// run-wide key of the same name, so the common case stays short:
 /// `--compare vp9,vp8` compares two codecs at the same settings.
 #[derive(Debug, Clone)]
@@ -202,6 +205,7 @@ struct Spec {
     rc_mode: String,
     min_quantizer: u32,
     max_quantizer: u32,
+    error_resilient: bool,
     cq_level: u32,
 }
 
@@ -232,6 +236,7 @@ impl Spec {
             rc_mode: args.rc_mode.clone(),
             min_quantizer: args.min_quantizer,
             max_quantizer: args.max_quantizer,
+            error_resilient: args.error_resilient,
             cq_level: args.cq_level,
         };
 
@@ -311,6 +316,15 @@ impl Spec {
                     }
                     spec.max_quantizer = n as u32;
                 }
+                'e' => {
+                    let n = number("устойчивость к потерям e")?;
+                    if !(0..=1).contains(&n) {
+                        return Err(format!(
+                            "«{text}»: устойчивость к потерям — это 0 или 1, а не {n}"
+                        ));
+                    }
+                    spec.error_resilient = n == 1;
+                }
                 'l' => {
                     let n = number("уровень CQ l")?;
                     if !(0..=63).contains(&n) {
@@ -334,8 +348,8 @@ impl Spec {
                         "«{text}»: непонятная часть «{part}». Ожидались s (масштаб), \
                          t (потоки), c (cpu-used), b (битрейт), k (столбцы плиток), \
                          r (row-mt), n (порог покоя), q (мин. квантователь), \
-                         m (макс. квантователь), u (рейт-контроль), \
-                         l (уровень CQ), а не «{other}»"
+                         m (макс. квантователь), e (устойчивость к потерям), \
+                         u (рейт-контроль), l (уровень CQ), а не «{other}»"
                     ));
                 }
             }
@@ -398,6 +412,10 @@ fn usage() -> &'static str {
                                        раньше нижней: при масштабе 1 кодер достаёт
                                        до потолка и промахивается мимо битрейта
                                        вместо того, чтобы сжать сильнее
+    --error-resilient <0|1>            пережить потерю кадра, по умолчанию 0.
+                                       Ноль был зашит и не назывался выбором:
+                                       без этого одна потеря даёт кашу до
+                                       следующего ключевого кадра
     --cq-level <0..63>                 цель качества для --rc cq
     --compare <конф,конф,...>          мерить несколько конфигураций кодера на
                                        ОДНИХ И ТЕХ ЖЕ кадрах, в одном прогоне.
@@ -519,6 +537,15 @@ fn parse_args() -> Result<Args, String> {
             "--static-threshold" => {
                 args.static_threshold =
                     value()?.parse().map_err(|_| "--static-threshold ждёт число")?;
+            }
+            "--error-resilient" => {
+                args.error_resilient = match value()?.as_str() {
+                    "1" | "on" => true,
+                    "0" | "off" => false,
+                    other => {
+                        return Err(format!("--error-resilient ждёт 0 или 1, а не «{other}»"));
+                    }
+                };
             }
             "--max-q" => {
                 args.max_quantizer = value()?.parse().map_err(|_| "--max-q ждёт число")?;
@@ -722,6 +749,7 @@ fn encoder_settings(
     settings.static_threshold = args.static_threshold;
     settings.min_quantizer = args.min_quantizer;
     settings.max_quantizer = args.max_quantizer;
+    settings.error_resilient = args.error_resilient;
     settings.cq_level = args.cq_level;
     settings.rc_mode = RcMode::parse(&args.rc_mode)
         .ok_or(format!("неизвестный режим рейт-контроля: {}", args.rc_mode))?;
@@ -895,6 +923,7 @@ fn build_compare_encoders(
             settings.static_threshold = spec.static_threshold;
             settings.min_quantizer = spec.min_quantizer;
             settings.max_quantizer = spec.max_quantizer;
+            settings.error_resilient = spec.error_resilient;
             settings.cq_level = spec.cq_level;
             settings.rc_mode = RcMode::parse(&spec.rc_mode)
                 .ok_or(format!("«{}»: неизвестный режим {}", spec.label, spec.rc_mode))?;
@@ -1141,6 +1170,9 @@ fn main() {
             }
             if spec.max_quantizer != 56 {
                 extra.push_str(&format!(", макс. q {}", spec.max_quantizer));
+            }
+            if spec.error_resilient {
+                extra.push_str(", устойчив к потерям");
             }
             println!(
                 "  {:<14} {} в {}×{}, {} кбит/с, cpu-used {}, потоков {}{}",
