@@ -12,3 +12,6 @@
 *.shot
 *.raw
 *.bgra
+
+# macOS кладёт это в каждый каталог, где открывали Finder.
+.DS_Store
