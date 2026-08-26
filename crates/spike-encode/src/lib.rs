@@ -15,6 +15,27 @@ pub mod vpx;
 pub struct Encoded {
     pub bytes: usize,
     pub keyframe: bool,
+    /// The encoder took the frame and emitted no packet for it.
+    ///
+    /// Worth its own flag because `bytes == 0` cannot say it. A frame libvpx
+    /// dropped and a frame it coded into nothing arrive here identically, and
+    /// the difference is the whole question phase 0 asks: a run delivering
+    /// twelve frames a second because the screen was quiet and a run delivering
+    /// twelve because it could not keep up look the same in every other number
+    /// this harness prints.
+    ///
+    /// Always `false` today — rate control is configured with
+    /// `rc_dropframe_thresh` at its default of zero, so libvpx never drops. The
+    /// flag exists so that turning dropping on cannot be mistaken for the screen
+    /// going quiet.
+    pub dropped: bool,
+    /// The quantizer the encoder actually chose for this frame, 0..=63.
+    ///
+    /// `None` for a dropped frame, and on any codec that will not answer the
+    /// control. Reported because every conclusion this harness has reached about
+    /// rate control was reached by watching byte counts and reasoning backwards
+    /// to a number nobody was reading.
+    pub quantizer: Option<u8>,
 }
 
 /// Which encoder to run.

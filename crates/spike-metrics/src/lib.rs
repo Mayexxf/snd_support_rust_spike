@@ -85,6 +85,20 @@ impl Latencies {
             _ => "     —      —      —      —".to_owned(),
         }
     }
+
+    /// `p50 / p95 / max` as whole numbers, for samples that are not durations.
+    ///
+    /// The quantizer is the only one so far, and printing it through
+    /// [`Self::summary_ms`] would divide it by a thousand and call it
+    /// milliseconds.
+    fn summary_plain(&self) -> String {
+        match (self.percentile(0.50), self.percentile(0.95), self.max()) {
+            (Some(p50), Some(p95), Some(max)) => {
+                format!("{p50:>6} {p95:>6} {max:>6}")
+            }
+            _ => "     —      —      —".to_owned(),
+        }
+    }
 }
 
 /// One pass through the pipeline.
@@ -131,6 +145,14 @@ pub struct FrameStat {
     pub compare_us: Option<u64>,
     /// Whether the encoder emitted a keyframe.
     pub is_keyframe: bool,
+    /// The encoder took this frame and emitted nothing for it.
+    ///
+    /// Counted separately from a zero-byte frame, because the two are the
+    /// difference between "the screen was quiet" and "we could not keep up" —
+    /// and every other number in this report reads the same either way.
+    pub encode_dropped: bool,
+    /// The quantizer the encoder chose for this frame, 0..=63.
+    pub quantizer: Option<u8>,
 }
 
 /// Accumulates per-frame statistics over one run.
@@ -150,6 +172,8 @@ pub struct Recorder {
     frames_seen: u64,
     frames_new: u64,
     keyframes: u64,
+    encode_drops: u64,
+    quantizer: Latencies,
     changed_px_total: u128,
     copied_px_total: u128,
     dirty_rects_total: u64,
@@ -163,6 +187,7 @@ pub struct Recorder {
     tracks: Vec<Track>,
     comparing: bool,
     stand_in: Option<String>,
+    unpaced: bool,
 }
 
 impl Recorder {
@@ -182,6 +207,8 @@ impl Recorder {
             frames_seen: 0,
             frames_new: 0,
             keyframes: 0,
+            encode_drops: 0,
+            quantizer: Latencies::default(),
             changed_px_total: 0,
             copied_px_total: 0,
             dirty_rects_total: 0,
@@ -195,7 +222,19 @@ impl Recorder {
             tracks: Vec::new(),
             comparing: false,
             stand_in: None,
+            unpaced: false,
         }
+    }
+
+    /// Declare that this run was fed frames as fast as it could take them.
+    ///
+    /// `--frames` over a screenshot deliberately drops the pacing, so that a
+    /// fast machine does not spend the difference waiting and read as slow. The
+    /// wall clock is then not the timeline the stream would have occupied, and
+    /// the bitrate has to be rebuilt from the target rate instead — see
+    /// [`Report::mbps`].
+    pub fn note_unpaced(&mut self) {
+        self.unpaced = true;
     }
 
     /// Declare that this run's costs are not what the product would pay, and why.
@@ -238,12 +277,22 @@ impl Recorder {
         }
         self.frames_new += 1;
         self.work.push(stat.work_us);
-        if stat.readback_us > 0 {
-            self.readback.push(stat.readback_us);
-        }
-        if stat.convert_us > 0 {
-            self.convert.push(stat.convert_us);
-        }
+        // Pushed unconditionally, including zeros.
+        //
+        // These two used to be filtered on `> 0`, which looks like "skip the
+        // stage that did not run" and is in fact a censored sample: the timers
+        // truncate to whole microseconds, so a cheap frame reads 0 and was
+        // dropped while a dear one was kept. Every percentile on these two rows
+        // came out biased upward, and the bias grew as the stage got cheaper —
+        // which is precisely backwards, since the cheap case is the one a change
+        // is trying to produce. `budget` counted the same frame as zero all
+        // along (below), so the two rows were printed side by side in one table
+        // having been computed over different sets of frames.
+        //
+        // A stage that genuinely did not run contributes a zero, which is the
+        // truth about that frame.
+        self.readback.push(stat.readback_us);
+        self.convert.push(stat.convert_us);
         if let Some(us) = stat.compare_us {
             self.compare.push(us);
         }
@@ -265,7 +314,15 @@ impl Recorder {
         if let Some(us) = stat.encode_us {
             self.encode.push(us);
         }
-        if let Some(bytes) = stat.encoded_bytes {
+        if let Some(q) = stat.quantizer {
+            self.quantizer.push(q as u64);
+        }
+        if stat.encode_dropped {
+            // Counted, and kept out of the delta average: a dropped frame is
+            // zero bytes, and averaging it in would quietly pull the delta size
+            // down while looking like better compression.
+            self.encode_drops += 1;
+        } else if let Some(bytes) = stat.encoded_bytes {
             self.encoded_bytes_total += bytes as u128;
             if stat.is_keyframe {
                 self.keyframes += 1;
@@ -308,6 +365,8 @@ impl Recorder {
             frames_seen: self.frames_seen,
             frames_new: self.frames_new,
             keyframes: self.keyframes,
+            encode_drops: self.encode_drops,
+            quantizer: self.quantizer,
             changed_px_total: self.changed_px_total,
             copied_px_total: self.copied_px_total,
             dirty_rects_total: self.dirty_rects_total,
@@ -320,6 +379,7 @@ impl Recorder {
             cpu,
             tracks: self.tracks,
             stand_in: self.stand_in,
+            unpaced: self.unpaced,
         }
     }
 }
@@ -342,6 +402,10 @@ pub struct Report {
     pub frames_seen: u64,
     pub frames_new: u64,
     pub keyframes: u64,
+    /// Frames the encoder took and emitted nothing for. See [`FrameStat::encode_dropped`].
+    pub encode_drops: u64,
+    /// Quantizer chosen per frame, 0..=63.
+    pub quantizer: Latencies,
     pub changed_px_total: u128,
     pub copied_px_total: u128,
     pub dirty_rects_total: u64,
@@ -358,6 +422,11 @@ pub struct Report {
     /// Why this run's per-frame budget is not what the product would pay.
     /// `None` for a live screen, which is the only source that earns a verdict.
     pub stand_in: Option<String>,
+    /// True when the run was not held to the target frame rate — `--frames`
+    /// over a screenshot, where frames are fed as fast as the machine manages.
+    ///
+    /// Only the bitrate cares, and it cares a lot: see [`Report::mbps`].
+    pub unpaced: bool,
 }
 
 impl Report {
@@ -444,8 +513,31 @@ impl Report {
     }
 
     /// Average bitrate over the whole run, in megabits per second.
+    ///
+    /// The denominator is the timeline the stream would have occupied, which is
+    /// the wall clock only while the run is paced. Under `--frames` it is not:
+    /// pacing is dropped on purpose so a fast machine does not read as slow, the
+    /// frames go by several times faster than real time, and dividing bytes by
+    /// the wall clock printed 11.93 Mbit/s for a stream that carries 1.99. The
+    /// error was exactly the speed-up, and it went into the reports unmarked.
+    ///
+    /// Rebuilding it from the poll count and the target rate is right for both
+    /// cases and stays right for a still screen: a poll that found nothing
+    /// occupies its slot in the timeline and contributes no bytes, which is what
+    /// makes an idle session cheap. Only the paced case is left on the clock,
+    /// because there the polls are the clock, and a backend that spins — DDA
+    /// returns immediately on a cursor-only frame — would otherwise inflate the
+    /// count and understate the rate.
+    ///
+    /// The mirror image of this mistake was caught long ago: `--compare` refuses
+    /// to print a bitrate at all, because several encoders per frame depress the
+    /// rate the other way. One sign of the error was guarded, the other was not.
     pub fn mbps(&self) -> f64 {
-        let secs = self.elapsed.as_secs_f64();
+        let secs = if self.unpaced {
+            self.frames_seen as f64 / self.target_fps.max(1) as f64
+        } else {
+            self.elapsed.as_secs_f64()
+        };
         if secs <= 0.0 {
             return 0.0;
         }
@@ -606,6 +698,11 @@ pub struct TrackStat {
     pub encode_us: u64,
     pub bytes: usize,
     pub keyframe: bool,
+    /// The encoder took this frame and emitted nothing for it.
+    /// See [`FrameStat::encode_dropped`].
+    pub dropped: bool,
+    /// The quantizer this configuration chose for this frame, 0..=63.
+    pub quantizer: Option<u8>,
 }
 
 /// One encoder configuration inside a comparison run.
@@ -641,6 +738,10 @@ pub struct Track {
     pub frames: u64,
     pub bytes_total: u128,
     pub keyframes: u64,
+    /// Frames the encoder took and emitted nothing for. See [`FrameStat::encode_dropped`].
+    pub encode_drops: u64,
+    /// Quantizer chosen per frame, 0..=63.
+    pub quantizer: Latencies,
     pub keyframe_bytes_total: u128,
     pub delta_frames: u64,
     pub delta_bytes_total: u128,
@@ -658,6 +759,8 @@ impl Track {
             frames: 0,
             bytes_total: 0,
             keyframes: 0,
+            encode_drops: 0,
+            quantizer: Latencies::default(),
             keyframe_bytes_total: 0,
             delta_frames: 0,
             delta_bytes_total: 0,
@@ -670,13 +773,20 @@ impl Track {
         self.encode.push(stat.encode_us);
         self.budget
             .push(stat.shared_us + stat.convert_us + stat.encode_us);
-        self.bytes_total += stat.bytes as u128;
-        if stat.keyframe {
-            self.keyframes += 1;
-            self.keyframe_bytes_total += stat.bytes as u128;
+        if let Some(q) = stat.quantizer {
+            self.quantizer.push(q as u64);
+        }
+        if stat.dropped {
+            self.encode_drops += 1;
         } else {
-            self.delta_frames += 1;
-            self.delta_bytes_total += stat.bytes as u128;
+            self.bytes_total += stat.bytes as u128;
+            if stat.keyframe {
+                self.keyframes += 1;
+                self.keyframe_bytes_total += stat.bytes as u128;
+            } else {
+                self.delta_frames += 1;
+                self.delta_bytes_total += stat.bytes as u128;
+            }
         }
     }
 
@@ -866,8 +976,14 @@ impl std::fmt::Display for Report {
             writeln!(s, "\n-- Сравнение на одних и тех же кадрах --")?;
             writeln!(
                 s,
-                "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}",
-                "конфигурация", "размер", "конверт.", "кодирование p50/p95", "бюджет p95", "разн.кадр"
+                "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>4}",
+                "конфигурация",
+                "размер",
+                "конверт.",
+                "кодирование p50/p95",
+                "бюджет p95",
+                "разн.кадр",
+                "q50"
             )?;
             for t in &self.tracks {
                 let size = format!("{}×{}", t.width, t.height);
@@ -898,10 +1014,17 @@ impl std::fmt::Display for Report {
                     Some(us) => format!("{:.1} мс", us as f64 / 1000.0),
                     None => "—".to_owned(),
                 };
+                // The median quantizer, because the whole argument about the
+                // ceiling was made from byte counts with this number unread. A
+                // row sitting at 56 is a row rate control could not finish.
+                let q = match t.quantizer.percentile(0.50) {
+                    Some(q) => format!("{q}"),
+                    None => "—".to_owned(),
+                };
                 writeln!(
                     s,
-                    "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}",
-                    t.label, size, conv, enc, bud, bytes
+                    "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>4}",
+                    t.label, size, conv, enc, bud, bytes, q
                 )?;
             }
 
@@ -973,11 +1096,32 @@ impl std::fmt::Display for Report {
         if self.encoded_bytes_total > 0 {
             writeln!(s, "\n-- Поток --")?;
             writeln!(s, "  средний битрейт         {:.2} Мбит/с", self.mbps())?;
+            if self.unpaced {
+                writeln!(
+                    s,
+                    "  (темп здесь не выдерживался, поэтому битрейт считан не по\n   \
+                     настенным часам, а по {} опросам при цели {} к/с — то есть по\n   \
+                     тому времени, которое поток занял бы на самом деле)",
+                    self.frames_seen, self.target_fps
+                )?;
+            }
             if let Some(b) = Report::mean_bytes(self.keyframe_bytes_total, self.keyframes) {
                 writeln!(s, "  ключевой кадр           {} КБ ({} шт.)", b / 1024, self.keyframes)?;
             }
             if let Some(b) = Report::mean_bytes(self.delta_bytes_total, self.delta_frames) {
                 writeln!(s, "  разностный кадр         {} Б ({} шт.)", b, self.delta_frames)?;
+            }
+            if !self.quantizer.is_empty() {
+                writeln!(s, "                          p50    p95    max")?;
+                writeln!(s, "  квантователь          {}", self.quantizer.summary_plain())?;
+            }
+            if self.encode_drops > 0 {
+                writeln!(
+                    s,
+                    "  кодер уронил кадров     {} — принял и не выдал ничего.\n  \
+                     Это не тихий экран, а нехватка: такие кадры до получателя не дошли",
+                    self.encode_drops
+                )?;
             }
         }
 
@@ -1051,6 +1195,8 @@ mod tests {
                     encode_us,
                     bytes,
                     keyframe: false,
+                    dropped: false,
+                    quantizer: None,
                 },
             );
         }
@@ -1177,6 +1323,57 @@ mod tests {
         assert_eq!(track.mean_delta_bytes(), Some(1_000));
         assert_eq!(track.mean_keyframe_bytes(), Some(60_000));
         assert_eq!(track.frames, 4);
+    }
+
+    #[test]
+    fn a_stage_that_cost_nothing_still_counts_as_a_sample() {
+        // The timers truncate to whole microseconds, so a cheap frame reads 0.
+        // Dropping those zeros censored the sample and biased every percentile
+        // on these two rows upward — worst on the cheapest stage, which is the
+        // one an optimisation is trying to produce.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        for _ in 0..9 {
+            r.record(&FrameStat { readback_us: 0, convert_us: 0, is_new: true, ..Default::default() });
+        }
+        r.record(&FrameStat { readback_us: 8_000, convert_us: 8_000, is_new: true, ..Default::default() });
+        let rep = r.finish(Duration::from_secs(1));
+
+        assert_eq!(rep.readback.len(), 10, "нулевые кадры выброшены из выборки");
+        assert_eq!(rep.convert.len(), 10);
+        // Nine of ten frames cost nothing, so the median must say so. Censored,
+        // it would have reported the single expensive frame as the median.
+        assert_eq!(rep.readback.percentile(0.50), Some(0));
+        assert_eq!(rep.readback.max(), Some(8_000));
+    }
+
+    #[test]
+    fn an_unpaced_run_bills_the_bitrate_to_the_timeline_it_would_have_taken() {
+        // `--frames` over a screenshot feeds frames as fast as the machine takes
+        // them, so the wall clock is not the timeline the stream occupies.
+        // 300 polls at 30 fps is ten seconds however fast they actually went.
+        let mut paced = Recorder::new("тест", 100, 100, 30);
+        let mut unpaced = Recorder::new("тест", 100, 100, 30);
+        unpaced.note_unpaced();
+        for r in [&mut paced, &mut unpaced] {
+            for _ in 0..300 {
+                r.record(&FrameStat {
+                    is_new: true,
+                    encode_us: Some(4_000),
+                    encoded_bytes: Some(7_795),
+                    ..Default::default()
+                });
+            }
+        }
+        // The run took 1.7 s of wall clock, six times faster than real time.
+        let wall = Duration::from_millis(1_700);
+        let on_the_clock = paced.finish(wall).mbps();
+        let on_the_timeline = unpaced.finish(wall).mbps();
+
+        // 7795 B x 300 x 8 / 10 s = 1.87 Mbit/s.
+        assert!((on_the_timeline - 1.8708).abs() < 0.01, "{on_the_timeline}");
+        // And the old behaviour, kept for the paced case, is the six-fold
+        // overstatement that went into the committed reports unmarked.
+        assert!(on_the_clock > on_the_timeline * 5.0, "{on_the_clock}");
     }
 
     #[test]

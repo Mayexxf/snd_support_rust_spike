@@ -65,6 +65,16 @@ pub const VPX_KF_AUTO: c_int = 1;
 // added below trustworthy rather than remembered.
 pub const VP8E_SET_CPUUSED: c_int = 13;
 pub const VP8E_SET_STATIC_THRESHOLD: c_int = 17;
+/// The only *getter* here, and it takes `int *` rather than `int` — see
+/// [`super::VpxEncoder::control_get`].
+///
+/// Reading the quantizer the encoder actually chose is what turns three of this
+/// harness's conclusions from inference into observation: that the ceiling of 56
+/// binds at scale 1, that the floor of 4 never does, and that
+/// `VP8E_SET_STATIC_THRESHOLD` stops working at scale 1 because the threshold it
+/// raises is already clamped by that same ceiling. All three were argued from
+/// byte counts alone, because this number was not being read.
+pub const VP8E_GET_LAST_QUANTIZER_64: c_int = 20;
 pub const VP8E_SET_CQ_LEVEL: c_int = 25;
 pub const VP9E_SET_TILE_COLUMNS: c_int = 33;
 pub const VP9E_SET_TUNE_CONTENT: c_int = 43;

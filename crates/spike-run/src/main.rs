@@ -1169,6 +1169,17 @@ fn main() {
     if let Some(why) = source.stand_in() {
         rec.note_stand_in(why);
     }
+    // `--frames` over a screenshot drops the pacing on purpose (see `build_image`),
+    // so the wall clock stops being the timeline the stream would occupy. Only the
+    // bitrate depends on that, and it depended on it silently until now.
+    //
+    // The condition mirrors `build_image` exactly rather than asking the source,
+    // because the synthetic source is also a stand-in and is paced regardless of
+    // `--frames`: gating on `stand_in()` would mark it unpaced and quietly move
+    // its bitrate instead.
+    if args.frames.is_some() && args.source.starts_with("image:") {
+        rec.note_unpaced();
+    }
     for (label, tw, th) in track_labels {
         rec.add_track(label, tw, th);
     }
@@ -1231,9 +1242,23 @@ fn main() {
                     } else {
                         // Convert once per distinct scale, before any encoding,
                         // so no configuration is charged for another's work.
-                        for (i, plane) in planes.iter_mut().enumerate() {
+                        //
+                        // Rotated for the same reason the encoding loop below is
+                        // rotated, and it was not: whoever converts first reads a
+                        // cold BGRA frame and every later scale finds it in cache.
+                        // The scales are sorted ascending, so without this the
+                        // largest one paid that cost on every frame of every run —
+                        // a fixed bias pointing straight at the conclusion this
+                        // table exists to test, that downscaling is worth it.
+                        //
+                        // Rotated over its own length rather than sharing the
+                        // encoder's counter, so a configuration is not first at
+                        // both stages on the same frames.
+                        let np = planes.len();
+                        for k in 0..np {
+                            let i = (k + rotate) % np;
                             let t = Instant::now();
-                            plane.convert_bgra(bgra, frame.stride, rects);
+                            planes[i].convert_bgra(bgra, frame.stride, rects);
                             convert_by_scale[i] = t.elapsed().as_micros() as u64;
                         }
 
@@ -1259,6 +1284,8 @@ fn main() {
                                         encode_us: t.elapsed().as_micros() as u64,
                                         bytes: out.bytes,
                                         keyframe: out.keyframe,
+                                        dropped: out.dropped,
+                                        quantizer: out.quantizer,
                                     },
                                 ),
                                 Err(e) => {
@@ -1287,6 +1314,8 @@ fn main() {
                     encode_us: encoded.map(|(us, _)| us),
                     encoded_bytes: encoded.map(|(_, out)| out.bytes),
                     is_keyframe: encoded.is_some_and(|(_, out)| out.keyframe),
+                    encode_dropped: encoded.is_some_and(|(_, out)| out.dropped),
+                    quantizer: encoded.and_then(|(_, out)| out.quantizer),
                 };
                 rec.record(&stat);
                 frames_done += 1;

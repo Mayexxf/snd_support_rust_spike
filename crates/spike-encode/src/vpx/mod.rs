@@ -261,6 +261,22 @@ impl VpxEncoder {
         check(err, "vpx_codec_control_")
     }
 
+    /// Read a control that answers into an `int` the caller owns.
+    ///
+    /// Separate from [`Self::control`] because the variadic argument is a
+    /// pointer rather than a value, and passing one where the other is expected
+    /// is exactly the kind of mistake a hand-written FFI exists to make. The
+    /// getters are a distinct half of `vp8e_enc_control_id` — every `*_GET_*`
+    /// member — and none of them was reachable before.
+    fn control_get(&mut self, id: c_int) -> Result<i32, String> {
+        let mut out: c_int = 0;
+        // SAFETY: vpx_codec_control_ is variadic; the GET controls take `int *`,
+        // and `out` is a live, correctly typed local that outlives the call.
+        let err = unsafe { ffi::vpx_codec_control_(&mut self.ctx, id, &mut out as *mut c_int) };
+        check(err, "vpx_codec_control_")?;
+        Ok(out)
+    }
+
     pub fn codec(&self) -> Codec {
         self.codec
     }
@@ -327,6 +343,7 @@ impl VpxEncoder {
 
         let mut bytes = 0usize;
         let mut keyframe = false;
+        let mut packets = 0usize;
         let mut iter: *const std::os::raw::c_void = std::ptr::null();
         loop {
             // SAFETY: the iterator protocol is libvpx's own — call until null.
@@ -336,6 +353,7 @@ impl VpxEncoder {
                 // SAFETY: the active union member is determined by `kind`, which
                 // was just checked.
                 let f = unsafe { pkt.data.frame };
+                packets += 1;
                 bytes += f.sz;
                 keyframe |= f.flags & ffi::VPX_FRAME_IS_KEY != 0;
                 if let Some(out) = payload.as_deref_mut() {
@@ -349,7 +367,21 @@ impl VpxEncoder {
             }
         }
 
-        Ok(Encoded { bytes, keyframe })
+        // Read after the packets, not before: the control reports the quantizer
+        // of the frame just encoded, and there is no frame to ask about until
+        // this one has been. A dropped frame has none, and a codec that refuses
+        // the control at all must not take the run down with it — the quantizer
+        // is worth knowing, not worth dying for.
+        let quantizer = (packets > 0)
+            .then(|| self.control_get(ffi::VP8E_GET_LAST_QUANTIZER_64).ok())
+            .flatten()
+            .and_then(|q| u8::try_from(q).ok());
+
+        // No packet at all means libvpx took the frame and emitted nothing for
+        // it. With `lag_in_frames` at zero there is no lookahead to hold it, so
+        // the only way here is rate control dropping the frame. Reported rather
+        // than folded into a zero-byte frame — see `Encoded::dropped`.
+        Ok(Encoded { bytes, keyframe, dropped: packets == 0, quantizer })
     }
 
     /// Append libvpx's own explanation, which is usually the useful half.
