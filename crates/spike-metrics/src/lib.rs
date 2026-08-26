@@ -182,6 +182,8 @@ pub struct Recorder {
     keyframes: u64,
     encode_drops: u64,
     pointer_only: u64,
+    moved_px_total: u128,
+    moved_rects_total: u64,
     quantizer: Latencies,
     changed_px_total: u128,
     copied_px_total: u128,
@@ -219,6 +221,8 @@ impl Recorder {
             keyframes: 0,
             encode_drops: 0,
             pointer_only: 0,
+            moved_px_total: 0,
+            moved_rects_total: 0,
             quantizer: Latencies::default(),
             changed_px_total: 0,
             copied_px_total: 0,
@@ -256,6 +260,13 @@ impl Recorder {
     /// screen in the first place.
     pub fn note_pointer_only(&mut self, polls: u64) {
         self.pointer_only = polls;
+    }
+
+    /// How much of the change the driver described as a blit rather than a
+    /// repaint. Taken from the source at the end for the same reason as above.
+    pub fn note_moved(&mut self, pixels: u128, rects: u64) {
+        self.moved_px_total = pixels;
+        self.moved_rects_total = rects;
     }
 
     /// Declare that this run's costs are not what the product would pay, and why.
@@ -394,6 +405,8 @@ impl Recorder {
             keyframes: self.keyframes,
             encode_drops: self.encode_drops,
             pointer_only: self.pointer_only,
+            moved_px_total: self.moved_px_total,
+            moved_rects_total: self.moved_rects_total,
             quantizer: self.quantizer,
             changed_px_total: self.changed_px_total,
             copied_px_total: self.copied_px_total,
@@ -439,6 +452,10 @@ pub struct Report {
     /// [`spike_capture::FrameSource::pointer_only_polls`] — counted apart from
     /// still polls because a moving cursor is something the product must send.
     pub pointer_only: u64,
+    /// Pixels blitted rather than repainted. See
+    /// [`spike_capture::FrameSource::moved_pixels`].
+    pub moved_px_total: u128,
+    pub moved_rects_total: u64,
     /// Quantizer chosen per frame, 0..=63.
     pub quantizer: Latencies,
     pub changed_px_total: u128,
@@ -886,6 +903,19 @@ impl std::fmt::Display for Report {
             "  экран не менялся        {:.1}% опросов",
             self.still_share() * 100.0
         )?;
+        if self.moved_rects_total > 0 && self.changed_px_total > 0 {
+            // A share of the changed area, not an addition to it. This is the
+            // part a copy path could satisfy inside the CPU buffer, sending
+            // nothing across the bus — the size of a saving nobody has taken.
+            let share = self.moved_px_total as f64 / self.changed_px_total as f64;
+            writeln!(
+                s,
+                "  из них перенесено       {:.1}% площади ({} прямоугольников) — \
+                 не перерисовано, а сдвинуто",
+                share * 100.0,
+                self.moved_rects_total
+            )?;
+        }
         if self.pointer_only > 0 {
             // Part of the share above, and not idle: the desktop image was the
             // same but the cursor had moved, and a product has to send that.

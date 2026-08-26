@@ -235,6 +235,22 @@ pub trait FrameSource {
         0
     }
 
+    /// Pixels and rectangles the API said were **blitted** rather than
+    /// repainted, cumulative over the run.
+    ///
+    /// Part of the changed area, not extra: they are counted in it. Reported
+    /// apart because they are the part a copy path could satisfy without
+    /// touching the bus at all, by moving the block inside the CPU buffer. How
+    /// large that unclaimed saving is has never been measured, and the first
+    /// attempt to check it went wrong in an instructive way — a browser
+    /// composites its scrolling on the GPU and reports no moves whatever, so the
+    /// obvious test subject proves nothing.
+    ///
+    /// Zero for every source that does not distinguish the two.
+    fn moved_pixels(&self) -> (u128, u64) {
+        (0, 0)
+    }
+
     /// Why this source's per-frame costs are not what the product would pay.
     ///
     /// `None` for a live screen, which is the only source entitled to a verdict.

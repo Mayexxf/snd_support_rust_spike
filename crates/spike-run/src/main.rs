@@ -1357,6 +1357,8 @@ fn main() {
     // the ones the loop threw away as "no new frame", which is how a moving
     // cursor came to be counted as a still screen.
     rec.note_pointer_only(source.pointer_only_polls());
+    let (moved_px, moved_rects) = source.moved_pixels();
+    rec.note_moved(moved_px, moved_rects);
     let report = rec.finish(started.elapsed());
     println!("{report}");
 

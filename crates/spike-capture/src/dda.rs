@@ -80,6 +80,10 @@ pub struct DdaSource {
     /// full one however the caller asked. Without this the first frame after a
     /// UAC prompt would be three quarters uninitialised memory.
     force_full: bool,
+    /// Pixels the driver said were blitted rather than repainted, cumulative.
+    moved_px: u128,
+    /// Move rectangles seen, cumulative.
+    moved_rects: u64,
     /// Polls where only the pointer moved. See `FrameSource::pointer_only_polls`.
     pointer_only: u64,
     /// Frames copied so far. Only used to alternate path order in comparison
@@ -198,6 +202,8 @@ impl DdaSource {
                 rect_scratch: Vec::new(),
                 move_scratch: Vec::new(),
                 pointer_only: 0,
+                moved_px: 0,
+                moved_rects: 0,
                 dirty: Vec::new(),
                 buf: Vec::new(),
                 stride: 0,
@@ -286,12 +292,23 @@ impl DdaSource {
         };
         if moved.is_ok() {
             let count = move_bytes as usize / size_of::<DXGI_OUTDUPL_MOVE_RECT>();
-            self.dirty.extend(self.move_scratch[..count].iter().map(|m| Rect {
-                left: m.DestinationRect.left,
-                top: m.DestinationRect.top,
-                right: m.DestinationRect.right,
-                bottom: m.DestinationRect.bottom,
-            }));
+            for m in &self.move_scratch[..count] {
+                let r = Rect {
+                    left: m.DestinationRect.left,
+                    top: m.DestinationRect.top,
+                    right: m.DestinationRect.right,
+                    bottom: m.DestinationRect.bottom,
+                };
+                // Counted apart from the total, because "was blitted" and "was
+                // repainted" cost the same to copy today and would not if the
+                // copy path blitted within the CPU buffer instead. The size of
+                // that unclaimed saving is exactly this number, and without it
+                // the question stays a guess — as it did when a browser turned
+                // out to composite its scrolling and report no moves at all.
+                self.moved_px += r.area() as u128;
+                self.moved_rects += 1;
+                self.dirty.push(r);
+            }
         }
 
         let mut required: u32 = 0;
@@ -817,6 +834,10 @@ impl FrameSource for DdaSource {
 
     fn pointer_only_polls(&self) -> u64 {
         self.pointer_only
+    }
+
+    fn moved_pixels(&self) -> (u128, u64) {
+        (self.moved_px, self.moved_rects)
     }
 
     fn reinit(&mut self) -> Result<(), CaptureError> {
