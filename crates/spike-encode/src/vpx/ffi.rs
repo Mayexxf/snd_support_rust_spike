@@ -37,6 +37,11 @@ pub const VPX_MAX_LAYERS: usize = 12;
 /// from the 1.15.1 headers. libvpx rejects a caller whose value disagrees.
 pub const VPX_ENCODER_ABI_VERSION: c_int = 37;
 
+/// `3 + VPX_CODEC_ABI_VERSION(9)`, and that one is `4 + VPX_IMAGE_ABI_VERSION(5)`
+/// — all three expanded from the 1.15.1 headers. Guards the decoder the same
+/// way the number above guards the encoder.
+pub const VPX_DECODER_ABI_VERSION: c_int = 12;
+
 pub const VPX_CODEC_OK: c_int = 0;
 pub const VPX_CODEC_CX_FRAME_PKT: c_int = 0;
 pub const VPX_FRAME_IS_KEY: u32 = 0x1;
@@ -48,13 +53,22 @@ pub const VPX_IMG_FMT_I420: c_int = 258;
 pub const VPX_RC_ONE_PASS: c_int = 0;
 pub const VPX_VBR: c_int = 0;
 pub const VPX_CBR: c_int = 1;
+pub const VPX_CQ: c_int = 2;
 pub const VPX_KF_FIXED: c_int = 0;
 pub const VPX_KF_AUTO: c_int = 1;
 
+// Control ids are positions in `vp8e_enc_control_id`, an enum that assigns only
+// four of its members explicitly (`VP8E_SET_ROI_MAP = 8`, `VP8E_SET_SCALEMODE
+// = 11`, `VP8E_SET_CPUUSED = 13`, `VP9E_SET_MIN_GF_INTERVAL = 48`) and lets the
+// rest fall out of the order. Walking that order from the 1.15.1 header
+// reproduces the four values already written here, which is what makes the two
+// added below trustworthy rather than remembered.
 pub const VP8E_SET_CPUUSED: c_int = 13;
 pub const VP8E_SET_STATIC_THRESHOLD: c_int = 17;
+pub const VP8E_SET_CQ_LEVEL: c_int = 25;
 pub const VP9E_SET_TILE_COLUMNS: c_int = 33;
 pub const VP9E_SET_TUNE_CONTENT: c_int = 43;
+pub const VP9E_SET_ROW_MT: c_int = 55;
 
 /// Second member of `vp9e_tune_content`, which starts at zero — so 1, not 2.
 pub const VP9E_CONTENT_SCREEN: c_int = 1;
@@ -257,9 +271,41 @@ pub struct vpx_codec_cx_pkt {
     pub data: vpx_codec_cx_pkt_data,
 }
 
+/// Decoder configuration. Three fields in the 1.15.1 header, all `unsigned int`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct vpx_codec_dec_cfg {
+    pub threads: c_uint,
+    pub w: c_uint,
+    pub h: c_uint,
+}
+
 unsafe extern "C" {
     pub fn vpx_codec_vp8_cx() -> *mut c_void;
     pub fn vpx_codec_vp9_cx() -> *mut c_void;
+    pub fn vpx_codec_vp8_dx() -> *mut c_void;
+    pub fn vpx_codec_vp9_dx() -> *mut c_void;
+
+    pub fn vpx_codec_dec_init_ver(
+        ctx: *mut vpx_codec_ctx,
+        iface: *mut c_void,
+        cfg: *const vpx_codec_dec_cfg,
+        flags: c_long,
+        ver: c_int,
+    ) -> c_int;
+
+    pub fn vpx_codec_decode(
+        ctx: *mut vpx_codec_ctx,
+        data: *const u8,
+        data_sz: c_uint,
+        user_priv: *mut c_void,
+        deadline: c_long,
+    ) -> c_int;
+
+    pub fn vpx_codec_get_frame(
+        ctx: *mut vpx_codec_ctx,
+        iter: *mut *const c_void,
+    ) -> *mut vpx_image;
 
     pub fn vpx_codec_enc_config_default(
         iface: *mut c_void,

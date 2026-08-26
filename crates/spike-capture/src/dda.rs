@@ -49,6 +49,20 @@ pub struct DdaSource {
     adapter_name: String,
     /// Staging texture for GPU→CPU copies, rebuilt when the desktop resizes.
     staging: Option<ID3D11Texture2D>,
+    /// Second staging texture. Only [`Readback::Buffered`] uses it: it reads
+    /// this one while the GPU is still filling the other.
+    staging_alt: Option<ID3D11Texture2D>,
+    /// Which of the two the next buffered copy goes into.
+    write_alt: bool,
+    /// Regions copied into the texture that is *not* the next write target,
+    /// waiting to be mapped.
+    ///
+    /// `None` means nothing is in flight — the first frame after opening,
+    /// resizing, or losing the desktop.
+    pending: Option<Vec<Rect>>,
+    /// Regions the last buffered read actually put into `buf`. What the caller
+    /// has to be told changed, which is not what changed on screen this frame.
+    applied: Option<Vec<Rect>>,
     /// Scratch for the dirty-rect metadata the API writes into.
     rect_scratch: Vec<RECT>,
     dirty: Vec<Rect>,
@@ -143,6 +157,10 @@ impl DdaSource {
                 height,
                 adapter_name,
                 staging: None,
+                staging_alt: None,
+                write_alt: false,
+                pending: None,
+                applied: None,
                 rect_scratch: Vec::new(),
                 dirty: Vec::new(),
                 buf: Vec::new(),
@@ -247,10 +265,22 @@ impl DdaSource {
                     .map_err(|e| CaptureError::Failed(format!("staging-текстура: {e}")))?;
             }
             self.staging = tex;
+            let mut alt: Option<ID3D11Texture2D> = None;
+            // SAFETY: same description, same lifetime as above.
+            unsafe {
+                self.device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut alt))
+                    .map_err(|e| CaptureError::Failed(format!("вторая staging-текстура: {e}")))?;
+            }
+            self.staging_alt = alt;
             self.width = desc.Width;
             self.height = desc.Height;
-            // A new staging texture shares nothing with the previous frame.
+            // A new staging texture shares nothing with the previous frame, and
+            // whatever the buffered path had in flight went with the old one.
             self.force_full = true;
+            self.pending = None;
+            self.applied = None;
+            self.write_alt = false;
         }
 
         let staging = self
@@ -322,6 +352,106 @@ impl DdaSource {
             }
         }
         let px = unsafe { self.map_and_copy(staging, desc, rects)? };
+        Ok((started.elapsed().as_micros() as u64, px))
+    }
+
+    /// Start this frame's copy, then read the one started last frame.
+    ///
+    /// The synchronous paths issue a copy and map the same texture immediately,
+    /// which parks the CPU until the GPU is done. Here the map targets the
+    /// *other* texture, whose copy was issued a frame ago and has had the whole
+    /// frame interval to finish. What it costs is one issued copy plus a map
+    /// that should already be satisfiable.
+    ///
+    /// The staging textures need no history: [`Self::map_and_copy`] reads only
+    /// the rectangles it is given, and those are the ones written into that same
+    /// texture. Only `buf` accumulates, and it always has.
+    ///
+    /// The first frame has nothing in flight, so it maps what it just issued and
+    /// pays the stall once. The second frame then re-reads the first frame's
+    /// regions — the same bytes into the same place, which costs a copy and
+    /// changes nothing.
+    unsafe fn copy_buffered(
+        &mut self,
+        src: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        rects: Option<&[Rect]>,
+    ) -> Result<(u64, u64), CaptureError> {
+        let started = Instant::now();
+
+        let a = self
+            .staging
+            .as_ref()
+            .ok_or_else(|| CaptureError::Failed("staging-текстура отсутствует".into()))?
+            .clone();
+        let b = self
+            .staging_alt
+            .as_ref()
+            .ok_or_else(|| CaptureError::Failed("вторая staging-текстура отсутствует".into()))?
+            .clone();
+        let (write, read) = if self.write_alt { (b, a) } else { (a, b) };
+
+        let now: Vec<Rect> = match rects {
+            Some(r) => r.to_vec(),
+            None => {
+                vec![Rect { left: 0, top: 0, right: desc.Width as i32, bottom: desc.Height as i32 }]
+            }
+        };
+
+        // Issue and do not wait.
+        match rects {
+            // SAFETY: both textures share a description.
+            None => unsafe { self.context.CopyResource(&write, src) },
+            Some(r) => {
+                for rr in r {
+                    let box_ = D3D11_BOX {
+                        left: rr.left as u32,
+                        top: rr.top as u32,
+                        front: 0,
+                        right: rr.right as u32,
+                        bottom: rr.bottom as u32,
+                        back: 1,
+                    };
+                    // SAFETY: the box is clamped to the source by the caller.
+                    unsafe {
+                        self.context.CopySubresourceRegion(
+                            &write,
+                            0,
+                            rr.left as u32,
+                            rr.top as u32,
+                            0,
+                            src,
+                            0,
+                            Some(&box_),
+                        );
+                    }
+                }
+            }
+        }
+
+        let applied = match self.pending.take() {
+            Some(prev) => {
+                // SAFETY: those regions were copied into `read` last frame.
+                unsafe { self.map_and_copy(&read, desc, &prev)? };
+                prev
+            }
+            None => {
+                // SAFETY: just copied into `write` above.
+                unsafe { self.map_and_copy(&write, desc, &now)? };
+                now.clone()
+            }
+        };
+
+        // **The caller must be told which regions actually moved.** `buf` now
+        // holds last frame's changes, not this frame's, and a caller handed
+        // this frame's rectangles would re-encode regions that still show the
+        // old pixels while leaving the ones that really changed alone. Measured
+        // before it was fixed: the delta frame went from 8607 bytes to 12761,
+        // because the encoder was being handed a picture that drifted.
+        let px = applied.iter().map(|r| r.area()).sum();
+        self.applied = Some(applied);
+        self.pending = Some(now);
+        self.write_alt = !self.write_alt;
         Ok((started.elapsed().as_micros() as u64, px))
     }
 
@@ -398,6 +528,12 @@ impl DdaSource {
 
         let result = match (mode, &partial) {
             (Readback::Off, _) => (0, 0, None),
+
+            (Readback::Buffered, _) => {
+                // SAFETY: prepared above; any rects are clamped.
+                let (us, px) = unsafe { self.copy_buffered(&src, &desc, partial.as_deref())? };
+                (us, px, None)
+            }
 
             (Readback::Full, _) | (Readback::Dirty, None) | (Readback::Compare, None) => {
                 // SAFETY: prepared above.
@@ -531,6 +667,16 @@ impl FrameSource for DdaSource {
         // frame budget, taking the verdict with it.
         let copies_us = u128::from(readback_us) + u128::from(compare_us.unwrap_or(0));
         let work_us = work_start.elapsed().as_micros().saturating_sub(copies_us) as u64;
+
+        // The buffered path filled `buf` from the frame *before* this one, so
+        // what changed on screen just now is not what changed in the buffer.
+        // Report the regions that were actually written, or every consumer
+        // downstream — conversion, encoder, the "changed area" line — is
+        // working from the wrong set.
+        let dirty = match self.applied.take() {
+            Some(rects) => Dirty::Rects(rects),
+            None => dirty,
+        };
 
         Ok(Some(Frame {
             width: self.width,

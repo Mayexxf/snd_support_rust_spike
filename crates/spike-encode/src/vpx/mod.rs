@@ -10,6 +10,7 @@
 //! Celeron N3150 can do, and a configuration tuned for anything else answers a
 //! different question.
 
+pub mod decode;
 pub mod ffi;
 
 use std::ffi::CStr;
@@ -17,6 +18,45 @@ use std::os::raw::c_int;
 
 use crate::convert::I420;
 use crate::{Codec, Encoded};
+
+/// How rate control spends the bitrate.
+///
+/// CBR is the default because a support session runs over a link with a
+/// ceiling, not over a disk. The other two are here to be measured against it:
+/// they buy time on easy frames by letting the bitrate move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RcMode {
+    Cbr,
+    Vbr,
+    Cq,
+}
+
+impl RcMode {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "cbr" => Some(Self::Cbr),
+            "vbr" => Some(Self::Vbr),
+            "cq" => Some(Self::Cq),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cbr => "cbr",
+            Self::Vbr => "vbr",
+            Self::Cq => "cq",
+        }
+    }
+
+    fn to_ffi(self) -> c_int {
+        match self {
+            Self::Cbr => ffi::VPX_CBR,
+            Self::Vbr => ffi::VPX_VBR,
+            Self::Cq => ffi::VPX_CQ,
+        }
+    }
+}
 
 /// How the encoder is set up. Every field here changes the answer, so all of
 /// them are visible rather than buried.
@@ -31,6 +71,43 @@ pub struct Settings {
     /// realtime setting VP9 offers, which is where a Celeron has to live.
     pub cpu_used: i32,
     pub threads: u32,
+    /// Tile columns, in log2 units: 0 is one column, 1 is two, up to 6.
+    ///
+    /// Threads have nothing to divide unless the frame is split. libvpx's own
+    /// default is 6, meaning "as many as the width allows" — and a tile column
+    /// may not be narrower than 256 pixels, so at 960 that is two, not sixty.
+    /// The lever therefore runs *downward*: fewer tiles cost a little less
+    /// compression each. Set to the same 6 by default so the knob is visible
+    /// rather than implied. VP9 only.
+    pub tile_columns: u32,
+    /// Row-level multithreading. Off in libvpx by default.
+    ///
+    /// Without it the only parallelism VP9 has is the tile columns above, which
+    /// at 960×540 is two — so the fourth thread had nothing to do. That is
+    /// exactly what the first thread sweep on this harness measured before this
+    /// field existed: two threads bought 1.37×, four bought a further 4%, and
+    /// the conclusion drawn was that VP9 does not scale. It does. With row-mt
+    /// on, four threads take p95 from 15.7 ms to 12.1 ms on the same 300
+    /// frames, and the budget from 61% to 50%. VP9 only.
+    pub row_mt: bool,
+    /// How different a block must be before it is encoded again.
+    ///
+    /// Zero — libvpx's default — looks at every block on every frame, including
+    /// the ones a blinking caret never touched. Understood by both codecs.
+    pub static_threshold: u32,
+    pub rc_mode: RcMode,
+    /// Floor on the quantizer. This harness has used 4 since the encoder went
+    /// in.
+    ///
+    /// **Measured, and it is not a lever.** Raising it to 20 and to 32 on 300
+    /// frames of dense text moved encoding by 0.2 ms — inside the noise — and
+    /// the delta frame by 35 bytes. On this content the rate cap binds long
+    /// before the floor does: the quantizer the encoder actually picks is far
+    /// above 4 already, so the floor is never what stops it. Kept because it
+    /// costs nothing to expose and the answer changes with the bitrate.
+    pub min_quantizer: u32,
+    /// Quality target for [`RcMode::Cq`]. Ignored by the other two modes.
+    pub cq_level: u32,
 }
 
 impl Settings {
@@ -47,6 +124,17 @@ impl Settings {
             // measure a machine with nothing else to do, which a client's
             // machine is not.
             threads: 2,
+            // Chosen so that adding these fields changes no measurement:
+            // tile_columns, row_mt, static_threshold and cq_level repeat
+            // libvpx's own defaults, rc_mode and min_quantizer repeat what this
+            // harness already hard-coded below. Every number in the reports
+            // taken before they existed stays comparable.
+            tile_columns: 6,
+            row_mt: false,
+            static_threshold: 0,
+            rc_mode: RcMode::Cbr,
+            min_quantizer: 4,
+            cq_level: 10,
         }
     }
 }
@@ -85,9 +173,9 @@ impl VpxEncoder {
         // session pays for that delay with the thing it is judged on.
         cfg.g_lag_in_frames = 0;
         cfg.g_error_resilient = 0;
-        cfg.rc_end_usage = ffi::VPX_CBR;
+        cfg.rc_end_usage = settings.rc_mode.to_ffi();
         cfg.rc_target_bitrate = settings.bitrate_kbps;
-        cfg.rc_min_quantizer = 4;
+        cfg.rc_min_quantizer = settings.min_quantizer;
         cfg.rc_max_quantizer = 56;
         // A small buffer keeps rate control reacting quickly, which matters more
         // than a smooth bitrate when the screen alternates between still and
@@ -132,11 +220,23 @@ impl VpxEncoder {
         let mut enc = Self { ctx, img, codec, settings, frame_no: 0 };
 
         enc.control(ffi::VP8E_SET_CPUUSED, settings.cpu_used)?;
+        // Skip blocks that barely moved. Both codecs understand it despite the
+        // VP8E_ name, and it is the only setting here aimed at the case a
+        // support session spends most of its time in: a screen that is almost,
+        // but not quite, still.
+        enc.control(ffi::VP8E_SET_STATIC_THRESHOLD, settings.static_threshold as c_int)?;
         // Tells the encoder the picture is a desktop: sharp edges, flat areas,
         // large regions identical between frames. Worth measuring precisely
         // because it is the one setting aimed at our actual content.
         if codec == Codec::Vp9 {
             enc.control(ffi::VP9E_SET_TUNE_CONTENT, ffi::VP9E_CONTENT_SCREEN)?;
+            enc.control(ffi::VP9E_SET_TILE_COLUMNS, settings.tile_columns as c_int)?;
+            enc.control(ffi::VP9E_SET_ROW_MT, c_int::from(settings.row_mt))?;
+        }
+        // Meaningless outside CQ, and libvpx rejects it for VP9 in some builds
+        // rather than ignoring it, so it is only sent when it is asked for.
+        if settings.rc_mode == RcMode::Cq {
+            enc.control(ffi::VP8E_SET_CQ_LEVEL, settings.cq_level as c_int)?;
         }
 
         Ok(enc)
@@ -159,6 +259,27 @@ impl VpxEncoder {
 
     /// Encode one frame.
     pub fn encode(&mut self, frame: &I420) -> Result<Encoded, String> {
+        self.encode_inner(frame, None)
+    }
+
+    /// Encode one frame and keep the bytes.
+    ///
+    /// Separate from [`Self::encode`] so the measured path never allocates: the
+    /// only caller that wants the payload is the one that has to *look* at the
+    /// picture, and it does not care what it cost.
+    pub fn encode_keeping(
+        &mut self,
+        frame: &I420,
+        payload: &mut Vec<u8>,
+    ) -> Result<Encoded, String> {
+        self.encode_inner(frame, Some(payload))
+    }
+
+    fn encode_inner(
+        &mut self,
+        frame: &I420,
+        mut payload: Option<&mut Vec<u8>>,
+    ) -> Result<Encoded, String> {
         if frame.width != self.settings.width || frame.height != self.settings.height {
             return Err(format!(
                 "кадр {}×{} не совпадает с настройкой {}×{}",
@@ -205,6 +326,14 @@ impl VpxEncoder {
                 let f = unsafe { pkt.data.frame };
                 bytes += f.sz;
                 keyframe |= f.flags & ffi::VPX_FRAME_IS_KEY != 0;
+                if let Some(out) = payload.as_deref_mut() {
+                    // SAFETY: libvpx owns `sz` bytes at `buf` and keeps them
+                    // valid until the next call into this codec instance; they
+                    // are copied out before that happens.
+                    out.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(f.buf as *const u8, f.sz)
+                    });
+                }
             }
         }
 

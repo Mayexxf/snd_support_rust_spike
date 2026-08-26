@@ -108,6 +108,25 @@ pub enum Readback {
     /// Costs two copies per frame, so the achieved frame rate of a comparison
     /// run means nothing. The per-frame timings are the output.
     Compare,
+    /// Copy only what changed, but read out the *previous* frame's copy.
+    ///
+    /// The synchronous paths above issue a GPU copy and then map the staging
+    /// texture immediately, which blocks the CPU until the GPU has finished.
+    /// This one keeps two staging textures: frame `i` starts a copy into one
+    /// and reads the other, which the GPU has had a whole frame to fill.
+    ///
+    /// **The pixels are one frame old.** That is the price, and it is not
+    /// hypothetical: a caller that acts on them is acting on the screen as it
+    /// was 33 ms ago at 30 fps. Kept separate from `Dirty` rather than replacing
+    /// it for exactly that reason.
+    ///
+    /// It cannot be folded into [`Readback::Compare`], and the reason is worth
+    /// stating: the whole point of this path is that its work lands on a
+    /// different frame from the one that asked for it, so there is no single
+    /// frame on which both paths can be timed fairly. Comparing it against
+    /// `Dirty` needs two runs — which everything else in this harness avoids —
+    /// so use a fixed `--frames` count and the same screenshot source for both.
+    Buffered,
 }
 
 impl Readback {
@@ -117,6 +136,7 @@ impl Readback {
             "full" => Readback::Full,
             "dirty" => Readback::Dirty,
             "compare" => Readback::Compare,
+            "buffered" => Readback::Buffered,
             _ => return None,
         })
     }

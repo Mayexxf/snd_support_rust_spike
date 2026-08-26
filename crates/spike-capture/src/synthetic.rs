@@ -165,7 +165,7 @@ impl FrameSource for SyntheticSource {
         let painted: &[Rect] = match readback {
             Readback::Off => &[],
             Readback::Full => &full,
-            Readback::Dirty | Readback::Compare => &rects,
+            Readback::Dirty | Readback::Compare | Readback::Buffered => &rects,
         };
         let paint_start = Instant::now();
         self.paint(painted);

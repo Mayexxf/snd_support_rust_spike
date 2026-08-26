@@ -426,7 +426,7 @@ impl FrameSource for ImageSource {
         let painted: Vec<Rect> = match readback {
             Readback::Off => Vec::new(),
             Readback::Full => vec![whole],
-            Readback::Dirty | Readback::Compare => rects.clone(),
+            Readback::Dirty | Readback::Compare | Readback::Buffered => rects.clone(),
         };
         let started = Instant::now();
         self.render(&painted);

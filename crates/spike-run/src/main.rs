@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 use std::path::{Path, PathBuf};
 
+/// Only the picture dump uses it, and that needs a decoder.
+#[cfg(feature = "vpx")]
+mod bmp;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -107,6 +111,8 @@ struct Args {
     frames: Option<u64>,
     /// Capture one frame to a file and stop.
     grab: Option<PathBuf>,
+    /// Encode, decode and write three pictures under this prefix, then stop.
+    dump: Option<PathBuf>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -119,6 +125,18 @@ struct Args {
     scale: u32,
     cpu_used: i32,
     threads: u32,
+    /// Tile columns in log2 units, VP9 only.
+    tile_columns: u32,
+    /// Row-level multithreading, VP9 only. Off is libvpx's own default.
+    row_mt: bool,
+    /// How different a block must be before the encoder looks at it again.
+    static_threshold: u32,
+    /// Kept as text for the same reason `motion` is: [`spike_encode::vpx`] only
+    /// exists when the harness is built with libvpx, and the argument has to
+    /// parse either way.
+    rc_mode: String,
+    min_quantizer: u32,
+    cq_level: u32,
     /// Encoder configurations to measure side by side on identical frames.
     /// Empty for an ordinary single-encoder run.
     compare: Vec<String>,
@@ -135,6 +153,7 @@ impl Default for Args {
             seconds: DEFAULT_SECONDS,
             frames: None,
             grab: None,
+            dump: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -145,6 +164,15 @@ impl Default for Args {
             scale: 1,
             cpu_used: 8,
             threads: 2,
+            // Repeat what the encoder would have done unasked, so that a run
+            // with none of these keys given is the same run as before they
+            // existed. See `Settings::new` for which is whose default.
+            tile_columns: 6,
+            row_mt: false,
+            static_threshold: 0,
+            rc_mode: "cbr".to_owned(),
+            min_quantizer: 4,
+            cq_level: 10,
             compare: Vec::new(),
         }
     }
@@ -152,11 +180,12 @@ impl Default for Args {
 
 /// One encoder configuration in a comparison run.
 ///
-/// Written as `vp9:s2:t4:c9:b1500` — the codec first, then any of scale,
-/// threads, cpu-used and bitrate in any order. Anything left out falls back to
-/// the run-wide `--scale`, `--threads`, `--cpu-used`, `--bitrate`, so the common
-/// case stays short: `--compare vp9,vp8` compares two codecs at the same
-/// settings.
+/// Written as `vp9:s2:t4:c9:b1500` — the codec first, then any of scale (`s`),
+/// threads (`t`), cpu-used (`c`), bitrate (`b`), tile columns (`k`), row-mt
+/// (`r`), static threshold (`n`), minimum quantizer (`q`), rate control (`u`)
+/// and CQ level (`l`), in any order. Anything left out falls back to the
+/// run-wide key of the same name, so the common case stays short:
+/// `--compare vp9,vp8` compares two codecs at the same settings.
 #[derive(Debug, Clone)]
 struct Spec {
     label: String,
@@ -165,6 +194,12 @@ struct Spec {
     threads: u32,
     cpu_used: i32,
     bitrate_kbps: u32,
+    tile_columns: u32,
+    row_mt: bool,
+    static_threshold: u32,
+    rc_mode: String,
+    min_quantizer: u32,
+    cq_level: u32,
 }
 
 impl Spec {
@@ -188,6 +223,12 @@ impl Spec {
             threads: args.threads,
             cpu_used: args.cpu_used,
             bitrate_kbps: args.bitrate_kbps,
+            tile_columns: args.tile_columns,
+            row_mt: args.row_mt,
+            static_threshold: args.static_threshold,
+            rc_mode: args.rc_mode.clone(),
+            min_quantizer: args.min_quantizer,
+            cq_level: args.cq_level,
         };
 
         for part in parts {
@@ -231,10 +272,58 @@ impl Spec {
                     }
                     spec.bitrate_kbps = n as u32;
                 }
+                'k' => {
+                    let n = number("столбцы плиток k")?;
+                    if !(0..=6).contains(&n) {
+                        return Err(format!("«{text}»: столбцы плиток вне диапазона 0..6"));
+                    }
+                    spec.tile_columns = n as u32;
+                }
+                'r' => {
+                    let n = number("row-mt r")?;
+                    if !(0..=1).contains(&n) {
+                        return Err(format!("«{text}»: row-mt — это 0 или 1, а не {n}"));
+                    }
+                    spec.row_mt = n == 1;
+                }
+                'n' => {
+                    let n = number("порог покоя n")?;
+                    if !(0..=100_000).contains(&n) {
+                        return Err(format!("«{text}»: порог покоя вне диапазона 0..100000"));
+                    }
+                    spec.static_threshold = n as u32;
+                }
+                'q' => {
+                    let n = number("минимальный квантователь q")?;
+                    if !(0..=63).contains(&n) {
+                        return Err(format!("«{text}»: квантователь вне диапазона 0..63"));
+                    }
+                    spec.min_quantizer = n as u32;
+                }
+                'l' => {
+                    let n = number("уровень CQ l")?;
+                    if !(0..=63).contains(&n) {
+                        return Err(format!("«{text}»: уровень CQ вне диапазона 0..63"));
+                    }
+                    spec.cq_level = n as u32;
+                }
+                // The one part that is a word rather than a number: writing the
+                // rate control mode as u0/u1/u2 would put the least memorable
+                // thing in the run into the label of every row of the table.
+                'u' => {
+                    if !matches!(value, "cbr" | "vbr" | "cq") {
+                        return Err(format!(
+                            "«{text}»: режим рейт-контроля — cbr, vbr или cq, а не «{value}»"
+                        ));
+                    }
+                    spec.rc_mode = value.to_owned();
+                }
                 other => {
                     return Err(format!(
                         "«{text}»: непонятная часть «{part}». Ожидались s (масштаб), \
-                         t (потоки), c (cpu-used), b (битрейт), а не «{other}»"
+                         t (потоки), c (cpu-used), b (битрейт), k (столбцы плиток), \
+                         r (row-mt), n (порог покоя), q (мин. квантователь), \
+                         u (рейт-контроль), l (уровень CQ), а не «{other}»"
                     ));
                 }
             }
@@ -255,6 +344,12 @@ fn usage() -> &'static str {
                                        синтетический — still, cursor, scroll, full
                                        снимок — still, caret, edit, scroll, drag
     --grab <файл>                      снять один кадр в файл и выйти
+    --dump <префикс>                   закодировать, декодировать и записать три
+                                       картинки: -src (источник), -enc (что
+                                       отдали кодеру) и -dec (что вернул
+                                       декодер). Не замер: отвечает на вопрос
+                                       «читается ли текст», на который таблицы
+                                       не отвечают
     --step <N>                         шаг прокрутки снимка, пикселей за кадр
     --frames <N>                       остановиться после N кадров с содержимым.
                                        Для сравнения машин между собой: обе должны
@@ -263,7 +358,7 @@ fn usage() -> &'static str {
     --seconds <N>                      длительность прогона (по умолчанию 30)
     --fps <N>                          целевая частота (по умолчанию 30)
     --size <ШxВ>                       размер для синтетического источника
-    --readback <dirty|full|compare|off>  что копировать из памяти GPU:
+    --readback <dirty|full|compare|buffered|off>  что копировать из памяти GPU:
                                        dirty   — только изменившиеся области (по умолчанию)
                                        full    — весь кадр каждый раз
                                        compare — оба пути на одном кадре, с замером
@@ -274,12 +369,28 @@ fn usage() -> &'static str {
                                        столько раз (при 2: 1920×1080 → 960×540)
     --cpu-used <N>                     скорость кодера: больше — быстрее и хуже
     --threads <N>                      потоков кодера, по умолчанию 2
+    --row-mt <0|1>                     построчная многопоточность VP9, по
+                                       умолчанию 0 — как в libvpx. Без неё
+                                       потокам достаются только столбцы плиток,
+                                       а их на 960 пикселях ширины два
+    --tile-columns <0..6>              столбцов плиток, в log2: 0 — один, 1 —
+                                       два. По умолчанию 6, как в libvpx: это
+                                       «сколько разрешит ширина», то есть рычаг
+                                       работает вниз, а не вверх
+    --static-threshold <N>             насколько блок должен измениться, чтобы
+                                       его кодировали заново. 0 (умолчание)
+                                       смотрит все блоки на каждом кадре
+    --rc <cbr|vbr|cq>                  режим рейт-контроля, по умолчанию cbr
+    --min-q <0..63>                    нижняя граница квантователя, по умолчанию 4
+    --cq-level <0..63>                 цель качества для --rc cq
     --compare <конф,конф,...>          мерить несколько конфигураций кодера на
                                        ОДНИХ И ТЕХ ЖЕ кадрах, в одном прогоне.
                                        Конфигурация: кодек[:sМасштаб][:tПотоки]
-                                       [:cCpuUsed][:bБитрейт], опущенное берётся
-                                       из ключей выше. Пример:
+                                       [:cCpuUsed][:bБитрейт][:kПлитки][:rRowMt]
+                                       [:nПорог][:qМинQ][:uРежим][:lУровеньCQ],
+                                       опущенное берётся из ключей выше. Пример:
                                          --compare vp9:s2:t2,vp9:s2:t4,vp8:s2
+                                         --compare vp9:s2:t4,vp9:s2:t4:r1
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -328,6 +439,7 @@ fn parse_args() -> Result<Args, String> {
                 args.frames = Some(n);
             }
             "--grab" => args.grab = Some(PathBuf::from(value()?)),
+            "--dump" => args.dump = Some(PathBuf::from(value()?)),
             "--step" => {
                 args.step = value()?.parse().map_err(|_| "--step ждёт число")?;
                 if args.step == 0 {
@@ -372,6 +484,47 @@ fn parse_args() -> Result<Args, String> {
             }
             "--threads" => {
                 args.threads = value()?.parse().map_err(|_| "--threads ждёт число")?;
+            }
+            "--tile-columns" => {
+                args.tile_columns =
+                    value()?.parse().map_err(|_| "--tile-columns ждёт число")?;
+                if args.tile_columns > 6 {
+                    return Err("--tile-columns вне диапазона 0..6".to_owned());
+                }
+            }
+            "--row-mt" => {
+                let v = value()?;
+                args.row_mt = match v.as_str() {
+                    "1" | "on" | "да" => true,
+                    "0" | "off" | "нет" => false,
+                    other => return Err(format!("--row-mt ждёт 0 или 1, а не {other}")),
+                };
+            }
+            "--static-threshold" => {
+                args.static_threshold =
+                    value()?.parse().map_err(|_| "--static-threshold ждёт число")?;
+            }
+            "--min-q" => {
+                args.min_quantizer = value()?.parse().map_err(|_| "--min-q ждёт число")?;
+                if args.min_quantizer > 63 {
+                    return Err("--min-q вне диапазона 0..63".to_owned());
+                }
+            }
+            "--cq-level" => {
+                args.cq_level = value()?.parse().map_err(|_| "--cq-level ждёт число")?;
+                if args.cq_level > 63 {
+                    return Err("--cq-level вне диапазона 0..63".to_owned());
+                }
+            }
+            // Checked here rather than at the encoder so a typo costs an error
+            // message instead of a run. The list is repeated from `RcMode`
+            // because that type only exists in a build with libvpx.
+            "--rc" => {
+                let v = value()?;
+                if !matches!(v.as_str(), "cbr" | "vbr" | "cq") {
+                    return Err(format!("--rc ждёт cbr, vbr или cq, а не {v}"));
+                }
+                args.rc_mode = v;
             }
             "--compare" => {
                 args.compare =
@@ -518,15 +671,38 @@ fn build_encoder(
     width: u32,
     height: u32,
 ) -> Result<Option<spike_encode::vpx::VpxEncoder>, String> {
-    use spike_encode::vpx::{Settings, VpxEncoder};
+    use spike_encode::vpx::VpxEncoder;
     if args.codec == Codec::None {
         return Ok(None);
     }
+    let settings = encoder_settings(args, width, height)?;
+    VpxEncoder::new(args.codec, settings).map(Some)
+}
+
+/// Every run-wide encoder key in one place.
+///
+/// Two callers build an encoder from `Args` — the measured run and `--dump` —
+/// and a knob wired into one but not the other would mean looking at a picture
+/// that no measurement produced.
+#[cfg(feature = "vpx")]
+fn encoder_settings(
+    args: &Args,
+    width: u32,
+    height: u32,
+) -> Result<spike_encode::vpx::Settings, String> {
+    use spike_encode::vpx::{RcMode, Settings};
     let mut settings = Settings::new(width, height, args.fps);
     settings.bitrate_kbps = args.bitrate_kbps;
     settings.cpu_used = args.cpu_used;
     settings.threads = args.threads;
-    VpxEncoder::new(args.codec, settings).map(Some)
+    settings.tile_columns = args.tile_columns;
+    settings.row_mt = args.row_mt;
+    settings.static_threshold = args.static_threshold;
+    settings.min_quantizer = args.min_quantizer;
+    settings.cq_level = args.cq_level;
+    settings.rc_mode = RcMode::parse(&args.rc_mode)
+        .ok_or(format!("неизвестный режим рейт-контроля: {}", args.rc_mode))?;
+    Ok(settings)
 }
 
 #[cfg(not(feature = "vpx"))]
@@ -541,6 +717,134 @@ fn build_encoder(args: &Args, _width: u32, _height: u32) -> Result<Option<Never>
     ))
 }
 
+/// Encode a few frames, decode them back, and write out three pictures.
+///
+/// Answers the one question the whole harness is built not to ask: is the text
+/// still readable. Everything else here prices an image; for most of phase 0
+/// nobody had seen one, and the lever that made every number look better —
+/// giving the encoder fewer pixels — is precisely the one that destroys what
+/// the operator on the other end is trying to read.
+///
+/// Three files, because the pipeline inflicts two separate losses and blaming
+/// the wrong one would send the work in the wrong direction:
+///
+///   `-src`  the source frame, untouched
+///   `-enc`  what the encoder was handed, so the downscale alone
+///   `-dec`  what came back out, so the downscale and the quantiser together
+///
+/// Nothing here is timed, and nothing here runs during a measurement.
+#[cfg(feature = "vpx")]
+fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
+    use spike_encode::vpx::VpxEncoder;
+    use spike_encode::vpx::decode::VpxDecoder;
+
+    let codec = if args.codec == Codec::None { Codec::Vp9 } else { args.codec };
+    let mut source = build_source(args)?;
+    println!("Источник: {}", source.describe());
+
+    // Past the keyframe that opens the stream, deliberately. A keyframe is the
+    // one frame the encoder never skimps on, and judging legibility by it would
+    // flatter every setting in this harness.
+    let want = args.frames.unwrap_or(30).max(2);
+    println!(
+        "Кодирую {want} кадров: {} при масштабе {}, {} кбит/с, cpu-used {} …",
+        codec.name(),
+        args.scale,
+        args.bitrate_kbps,
+        args.cpu_used
+    );
+
+    let mut plane: Option<I420> = None;
+    let mut encoder: Option<VpxEncoder> = None;
+    let mut decoder = VpxDecoder::new(codec)?;
+    let mut decoded: Option<spike_encode::vpx::decode::Decoded> = None;
+    let mut source_frame: Option<(u32, u32, usize, Vec<u8>)> = None;
+    let mut payload: Vec<u8> = Vec::new();
+    let mut last = None;
+    let mut done = 0u64;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while done < want && Instant::now() < deadline {
+        // Copy the pixels out and let the borrow on the source end here. This
+        // path is not timed, and the alternative is a borrow dance for nothing.
+        let grabbed = match source.next_frame(Duration::from_millis(200), Readback::Full) {
+            Ok(Some(f)) => f.bgra.map(|b| (f.width, f.height, f.stride, b.to_vec())),
+            Ok(None) => None,
+            Err(CaptureError::AccessLost) => {
+                source.reinit().map_err(|e| e.to_string())?;
+                None
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let Some((w, h, stride, bgra)) = grabbed else { continue };
+
+        if plane.is_none() {
+            let p = I420::new(w, h, args.scale);
+            let settings = encoder_settings(args, p.width, p.height)?;
+            encoder = Some(VpxEncoder::new(codec, settings)?);
+            plane = Some(p);
+        }
+        let (Some(p), Some(enc)) = (plane.as_mut(), encoder.as_mut()) else { continue };
+
+        let whole = Rect { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+        p.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+
+        payload.clear();
+        let out = enc.encode_keeping(p, &mut payload)?;
+        if !payload.is_empty() {
+            if let Some(d) = decoder.decode(&payload)? {
+                decoded = Some(d);
+            }
+        }
+        last = Some(out);
+        source_frame = Some((w, h, stride, bgra));
+        done += 1;
+    }
+
+    let Some((w, h, stride, bgra)) = source_frame else {
+        return Err("ни одного кадра с пикселями за 120 секунд".to_owned());
+    };
+    let plane = plane.ok_or("кадр не сконвертирован")?;
+    let decoded = decoded.ok_or("декодер не отдал ни одного кадра")?;
+    let last = last.ok_or("кодер не отдал ни одного кадра")?;
+
+    let name = |suffix: &str| -> PathBuf {
+        let mut p = prefix.as_os_str().to_owned();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+
+    let src = name("-src.bmp");
+    bmp::write(&src, w, h, &bmp::from_bgra(w, h, stride, &bgra))?;
+    let enc_path = name("-enc.bmp");
+    bmp::write(
+        &enc_path,
+        plane.width,
+        plane.height,
+        &bmp::from_i420(plane.width, plane.height, &plane.y, &plane.u, &plane.v),
+    )?;
+    let dec_path = name("-dec.bmp");
+    bmp::write(
+        &dec_path,
+        decoded.width,
+        decoded.height,
+        &bmp::from_i420(decoded.width, decoded.height, &decoded.y, &decoded.u, &decoded.v),
+    )?;
+
+    println!("\nКадров закодировано: {done}, последний — {} Б{}", last.bytes, if last.keyframe { ", ключевой" } else { "" });
+    println!("  {}  источник {w}×{h}", src.display());
+    println!("  {}  вход кодера {}×{}", enc_path.display(), plane.width, plane.height);
+    println!("  {}  выход декодера {}×{}", dec_path.display(), decoded.width, decoded.height);
+    println!("\nСмотреть глазами. Стенд может сказать, сколько это стоит,");
+    println!("и не может сказать, читается ли это.");
+    Ok(())
+}
+
+#[cfg(not(feature = "vpx"))]
+fn dump(_args: &Args, _prefix: &Path) -> Result<(), String> {
+    Err("стенд собран без libvpx, декодировать нечем. Пересоберите с --features vpx".to_owned())
+}
+
 /// Build one encoder per configuration under comparison.
 ///
 /// All of them are built before the run starts: a configuration libvpx refuses
@@ -553,7 +857,7 @@ fn build_compare_encoders(
     plane_of: &[usize],
     fps: u32,
 ) -> Result<Vec<spike_encode::vpx::VpxEncoder>, String> {
-    use spike_encode::vpx::{Settings, VpxEncoder};
+    use spike_encode::vpx::{RcMode, Settings, VpxEncoder};
     specs
         .iter()
         .zip(plane_of)
@@ -563,6 +867,13 @@ fn build_compare_encoders(
             settings.bitrate_kbps = spec.bitrate_kbps;
             settings.cpu_used = spec.cpu_used;
             settings.threads = spec.threads;
+            settings.tile_columns = spec.tile_columns;
+            settings.row_mt = spec.row_mt;
+            settings.static_threshold = spec.static_threshold;
+            settings.min_quantizer = spec.min_quantizer;
+            settings.cq_level = spec.cq_level;
+            settings.rc_mode = RcMode::parse(&spec.rc_mode)
+                .ok_or(format!("«{}»: неизвестный режим {}", spec.label, spec.rc_mode))?;
             VpxEncoder::new(spec.codec, settings).map_err(|e| format!("«{}»: {e}", spec.label))
         })
         .collect()
@@ -638,6 +949,14 @@ fn main() {
         return;
     }
 
+    if let Some(prefix) = args.dump.clone() {
+        if let Err(e) = dump(&args, &prefix) {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // The machine comes first, before any number, so a VM run cannot be mistaken
     // for a target run further down the page.
     let machine = Machine::detect();
@@ -678,8 +997,15 @@ fn main() {
             Readback::Full => "весь кадр",
             Readback::Dirty => "только изменившиеся области",
             Readback::Compare => "оба пути на каждом кадре (сравнение)",
+            Readback::Buffered =>
+                "только изменившиеся области, чтение отстаёт на кадр (конвейер)",
         }
     );
+    if args.readback == Readback::Buffered {
+        println!("Пиксели здесь на кадр старше кадра, который их принёс: путь начинает");
+        println!("копию и читает предыдущую. Сравнивать с dirty — отдельным прогоном при");
+        println!("том же --frames и том же источнике; на одном кадре эти два не сравнить.");
+    }
     if matches!(args.source.as_str(), "dda" | "auto") {
         println!("Не трогайте мышь, если меряете статичный стол; крутите документ, если прокрутку.");
     }
@@ -767,15 +1093,38 @@ fn main() {
         );
         for (i, spec) in specs.iter().enumerate() {
             let plane = &planes[plane_of[i]];
+            // Only settings that were actually turned appear. Printing all six
+            // on every row would bury the one that differs, and the one that
+            // differs is the entire point of the table.
+            let mut extra = String::new();
+            if spec.row_mt {
+                extra.push_str(", row-mt");
+            }
+            if spec.tile_columns != 6 {
+                extra.push_str(&format!(", плиток log2 {}", spec.tile_columns));
+            }
+            if spec.static_threshold != 0 {
+                extra.push_str(&format!(", порог покоя {}", spec.static_threshold));
+            }
+            if spec.rc_mode != "cbr" {
+                extra.push_str(&format!(", {}", spec.rc_mode));
+                if spec.rc_mode == "cq" {
+                    extra.push_str(&format!(" на {}", spec.cq_level));
+                }
+            }
+            if spec.min_quantizer != 4 {
+                extra.push_str(&format!(", мин. q {}", spec.min_quantizer));
+            }
             println!(
-                "  {:<14} {} в {}×{}, {} кбит/с, cpu-used {}, потоков {}",
+                "  {:<14} {} в {}×{}, {} кбит/с, cpu-used {}, потоков {}{}",
                 spec.label,
                 spec.codec.name(),
                 plane.width,
                 plane.height,
                 spec.bitrate_kbps,
                 spec.cpu_used,
-                spec.threads
+                spec.threads,
+                extra
             );
             track_labels.push((spec.label.clone(), plane.width, plane.height));
         }
