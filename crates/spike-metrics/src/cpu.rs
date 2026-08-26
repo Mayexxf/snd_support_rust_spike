@@ -145,17 +145,31 @@ mod tests {
 
     #[test]
     fn burning_cpu_shows_up_in_the_snapshot() {
+        // Burn until the counter moves, rather than for a fixed count of
+        // iterations.
+        //
+        // A fixed count cannot be right in both profiles. Windows quantises
+        // process CPU time at 15.6 ms, and the eight million multiplies this
+        // used to do were sized against a debug build: with the optimiser on
+        // they finish well inside one tick, the counter reads zero, and the
+        // test fails. It did exactly that — `cargo test` green, `cargo test
+        // --release` red, deterministically, for as long as both existed.
+        //
+        // The deadline is a backstop for a machine whose counter never moves
+        // at all, so the failure is a failed assertion and not a hung suite.
         let start = CpuSnapshot::now();
-        // Enough arithmetic to register above timer granularity without making
-        // the test suite slow. `black_box` stops the optimiser deleting it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut acc = 0u64;
-        for i in 0..8_000_000u64 {
-            acc = acc.wrapping_add(i.wrapping_mul(2_654_435_761));
+        let mut usage = start.elapsed_since();
+        while usage.total() == Duration::ZERO && std::time::Instant::now() < deadline {
+            for i in 0..2_000_000u64 {
+                acc = acc.wrapping_add(i.wrapping_mul(2_654_435_761));
+            }
+            std::hint::black_box(acc);
+            usage = start.elapsed_since();
         }
-        std::hint::black_box(acc);
-        let usage = start.elapsed_since();
 
-        assert!(usage.total() > Duration::ZERO, "CPU time did not advance");
+        assert!(usage.total() > Duration::ZERO, "за 5 с сжигания счётчик ЦП не сдвинулся");
         assert!(usage.cores >= 1);
     }
 
