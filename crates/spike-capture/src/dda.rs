@@ -138,10 +138,38 @@ impl DdaSource {
                 .map_err(|e| CaptureError::Unavailable(format!("IDXGIOutput1 недоступен: {e}")))?;
 
             let dupl = output1.DuplicateOutput(&device).map_err(|e| {
+                // The HRESULT separates "come back in a minute" from "this will
+                // never work here", and that is the whole question when a run
+                // fails on a machine somebody travelled to.
+                let hint = match e.code().0 as u32 {
+                    // E_ACCESSDENIED. The secure desktop — a locked screen, or a
+                    // UAC prompt — is not duplicable by an ordinary process, and
+                    // while it is up the session still reports itself as an
+                    // active console one. Measured: this is exactly what a
+                    // locked screen looks like from here, and none of the three
+                    // causes listed below is what happened.
+                    0x8007_0005 => {
+                        "экран заблокирован или на нём запрос UAC — защищённый \
+                         рабочий стол не дублируется; либо дублирование уже \
+                         держит другая программа"
+                    }
+                    // E_UNEXPECTED, which is what an RDP session answers.
+                    0x8000_FFFF => {
+                        "сеанс RDP: дублирование рабочего стола в нём не \
+                         открывается вовсе, мерить надо с физической консоли"
+                    }
+                    // DXGI_ERROR_UNSUPPORTED.
+                    0x887A_0004 => {
+                        "адаптер не поддерживает дублирование — обычно это \
+                         программный адаптер, WARP"
+                    }
+                    _ => {
+                        "частые причины: сеанс RDP, отсутствие монитора, \
+                         уже запущенная программа захвата"
+                    }
+                };
                 CaptureError::Unavailable(format!(
-                    "дублирование рабочего стола не открылось: {e}. \
-                     Частые причины: сеанс RDP, отсутствие монитора, \
-                     уже запущенная программа захвата"
+                    "дублирование рабочего стола не открылось: {e}. {hint}"
                 ))
             })?;
 
