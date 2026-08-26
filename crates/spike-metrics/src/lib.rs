@@ -676,12 +676,19 @@ impl Verdict {
     /// One place for the thresholds, so the per-track table of a comparison run
     /// and the verdict of a single run cannot quietly disagree about what
     /// "keeps up" means.
+    /// Below this the machine has room to spare.
+    pub const COMFORTABLE_BELOW: f64 = 0.5;
+    /// Below this it keeps up, with nothing left over for anything else.
+    pub const TIGHT_BELOW: f64 = 0.8;
+    /// Below this it keeps up only on an otherwise idle machine.
+    pub const MARGINAL_BELOW: f64 = 1.0;
+
     pub fn classify(share: f64) -> Self {
-        if share < 0.5 {
+        if share < Self::COMFORTABLE_BELOW {
             Verdict::Comfortable(share)
-        } else if share < 0.8 {
+        } else if share < Self::TIGHT_BELOW {
             Verdict::Tight(share)
-        } else if share < 1.0 {
+        } else if share < Self::MARGINAL_BELOW {
             Verdict::Marginal(share)
         } else {
             Verdict::Fails(share)
@@ -984,6 +991,29 @@ impl std::fmt::Display for Report {
             writeln!(s, "  интервал при {} к/с      {:.1} мс", self.target_fps, interval_ms)?;
             if let (Some(p50), Some(p95)) = (self.budget_share(0.50), self.budget_share(0.95)) {
                 writeln!(s, "  занято p50 / p95        {:.0}% / {:.0}%", p50 * 100.0, p95 * 100.0)?;
+                // The verdict below is a step function of the p95, and the
+                // steps were never printed. A reader saw 47% and a tick and
+                // could not tell whether that was comfortable by a mile or by
+                // half a point.
+                //
+                // It matters here more than it looks. Six consecutive runs of
+                // one configuration, driven so the content is identical to
+                // within a tenth of a percent of changed area, still spread
+                // across 46-49% of the budget. A configuration landing near a
+                // boundary will print opposite verdicts on consecutive runs
+                // with nothing wrong; naming the boundary is what lets the
+                // reader see that coming.
+                writeln!(
+                    s,
+                    "  пороги вердикта         {:.0}% запас · {:.0}% впритык · {:.0}% почти не успевает",
+                    Verdict::COMFORTABLE_BELOW * 100.0,
+                    Verdict::TIGHT_BELOW * 100.0,
+                    Verdict::MARGINAL_BELOW * 100.0
+                )?;
+                writeln!(
+                    s,
+                    "  (разброс между прогонами одной конфигурации — около трёх пунктов p95)"
+                )?;
             }
             match &self.stand_in {
                 Some(why) => {
