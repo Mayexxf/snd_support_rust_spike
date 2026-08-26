@@ -8,14 +8,14 @@
 # ShiftMediaProject are built against the dynamic runtime and will fail to link
 # with these flags.
 #
-# target-cpu=x86-64 is restated because a file passed with --config replaces the
+# target-cpu=x86-64-v2 is restated because a file passed with --config replaces the
 # rustflags of .cargo/config.toml rather than adding to them. Losing it is what
 # kills the binary on a Celeron with 0xc000001d before the first log line, so it
 # is written out here where its absence would be visible. /IGNORE:4099 is
 # restated for the same reason — see the note about it in config.toml.
 [target.x86_64-pc-windows-msvc]
 rustflags = [
-    "-C", "target-cpu=x86-64",
+    "-C", "target-cpu=x86-64-v2",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=/IGNORE:4099",
 ]

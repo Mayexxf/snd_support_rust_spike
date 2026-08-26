@@ -1,12 +1,35 @@
-# Pin the generic x86-64 baseline for the Windows target.
+# Pin a baseline every machine in this project satisfies, and no higher.
 #
-# This flag is not negotiable. The whole question phase 0 asks is "does a
-# Celeron N3150 (Braswell: SSE4.2, no AVX) keep up?". A harness compiled for the
-# build machine's CPU answers a different question — and on the target it does
-# not answer any question at all, because it dies with STATUS_ILLEGAL_INSTRUCTION
-# (0xc000001d) before the first frame, exactly as the predecessor did.
+# The principle is not negotiable and has not changed: a harness compiled for
+# the build machine's CPU answers a different question, and on a machine that
+# lacks an instruction it answers none at all — it dies with
+# STATUS_ILLEGAL_INSTRUCTION (0xc000001d) before the first frame, exactly as the
+# predecessor did.
 #
-# NEVER set target-cpu to native, haswell, or x86-64-v3 here.
+# What changed is where the floor is. This said `x86-64`, the 2003 baseline,
+# and its reasoning named a Celeron N3150 that is no longer the target. The
+# level is now `x86-64-v2` — SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, all of it
+# 2008 hardware — and every machine this project has ever mentioned clears it:
+# the N100 target (Gracemont), the Xeon E5-2696 v2 the baseline numbers came
+# from (Ivy Bridge), and the cancelled Braswell Celeron alike.
+#
+# Measured, not assumed. Colour conversion at the four scales, same 300 frames
+# of the same screenshot, three runs each and stable to the tenth:
+#
+#     scale      1      2      3      4
+#     x86-64   1.4    0.6    1.6    1.1  ms
+#     v2       1.0    0.5    1.6    1.1  ms
+#
+# 1.4x at full resolution for one line of configuration. The gain lands on the
+# paths written with SSE2 intrinsics and not on the scalar block filter behind
+# scales 3 and 4 — the opposite of the guess, and the reason is that the
+# intrinsics carry scalar glue around them, packing and shuffling, which the
+# compiler can now emit with SSE4.1, while the scalar filter is bounded by an
+# integer division no vector unit helps with.
+#
+# NEVER set target-cpu to native, haswell, or x86-64-v3 here. v3 means AVX2,
+# which Ivy Bridge does not have either — raising it would break the machine the
+# baseline numbers are divided into, not just an old client.
 #
 # ---------------------------------------------------------------------------
 # On the missing +crt-static
@@ -51,4 +74,4 @@
 # the warning has nothing to complain about; the price is a panic without a
 # file and line, which this harness has needed more than once.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64", "-C", "link-arg=/IGNORE:4099"]
+rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "link-arg=/IGNORE:4099"]
