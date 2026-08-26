@@ -106,6 +106,17 @@ pub struct Settings {
     /// above 4 already, so the floor is never what stops it. Kept because it
     /// costs nothing to expose and the answer changes with the bitrate.
     pub min_quantizer: u32,
+    /// The other end, and unlike the floor this one binds.
+    ///
+    /// VP9 quantizes up to 63; this harness capped it at 56 from the first
+    /// commit, unasked and unexposed. At `--scale 2` the cap never comes into
+    /// play and the run hits its bitrate. At `--scale 1` it does: the encoder
+    /// reaches 56, cannot spend any more quality to save bytes, and overshoots
+    /// the target instead — 24 KB per delta frame against a 8.3 KB budget.
+    ///
+    /// Exposed so the trade can be measured rather than inherited. Default
+    /// stays 56, so every number taken before this field existed still stands.
+    pub max_quantizer: u32,
     /// Quality target for [`RcMode::Cq`]. Ignored by the other two modes.
     pub cq_level: u32,
 }
@@ -134,6 +145,7 @@ impl Settings {
             static_threshold: 0,
             rc_mode: RcMode::Cbr,
             min_quantizer: 4,
+            max_quantizer: 56,
             cq_level: 10,
         }
     }
@@ -176,7 +188,7 @@ impl VpxEncoder {
         cfg.rc_end_usage = settings.rc_mode.to_ffi();
         cfg.rc_target_bitrate = settings.bitrate_kbps;
         cfg.rc_min_quantizer = settings.min_quantizer;
-        cfg.rc_max_quantizer = 56;
+        cfg.rc_max_quantizer = settings.max_quantizer;
         // A small buffer keeps rate control reacting quickly, which matters more
         // than a smooth bitrate when the screen alternates between still and
         // scrolling.

@@ -136,6 +136,7 @@ struct Args {
     /// parse either way.
     rc_mode: String,
     min_quantizer: u32,
+    max_quantizer: u32,
     cq_level: u32,
     /// Encoder configurations to measure side by side on identical frames.
     /// Empty for an ordinary single-encoder run.
@@ -172,6 +173,7 @@ impl Default for Args {
             static_threshold: 0,
             rc_mode: "cbr".to_owned(),
             min_quantizer: 4,
+            max_quantizer: 56,
             cq_level: 10,
             compare: Vec::new(),
         }
@@ -182,8 +184,8 @@ impl Default for Args {
 ///
 /// Written as `vp9:s2:t4:c9:b1500` — the codec first, then any of scale (`s`),
 /// threads (`t`), cpu-used (`c`), bitrate (`b`), tile columns (`k`), row-mt
-/// (`r`), static threshold (`n`), minimum quantizer (`q`), rate control (`u`)
-/// and CQ level (`l`), in any order. Anything left out falls back to the
+/// (`r`), static threshold (`n`), minimum quantizer (`q`), maximum quantizer
+/// (`m`), rate control (`u`) and CQ level (`l`), in any order. Anything left out falls back to the
 /// run-wide key of the same name, so the common case stays short:
 /// `--compare vp9,vp8` compares two codecs at the same settings.
 #[derive(Debug, Clone)]
@@ -199,6 +201,7 @@ struct Spec {
     static_threshold: u32,
     rc_mode: String,
     min_quantizer: u32,
+    max_quantizer: u32,
     cq_level: u32,
 }
 
@@ -228,6 +231,7 @@ impl Spec {
             static_threshold: args.static_threshold,
             rc_mode: args.rc_mode.clone(),
             min_quantizer: args.min_quantizer,
+            max_quantizer: args.max_quantizer,
             cq_level: args.cq_level,
         };
 
@@ -300,6 +304,13 @@ impl Spec {
                     }
                     spec.min_quantizer = n as u32;
                 }
+                'm' => {
+                    let n = number("максимальный квантователь m")?;
+                    if !(0..=63).contains(&n) {
+                        return Err(format!("«{text}»: квантователь вне диапазона 0..63"));
+                    }
+                    spec.max_quantizer = n as u32;
+                }
                 'l' => {
                     let n = number("уровень CQ l")?;
                     if !(0..=63).contains(&n) {
@@ -323,7 +334,8 @@ impl Spec {
                         "«{text}»: непонятная часть «{part}». Ожидались s (масштаб), \
                          t (потоки), c (cpu-used), b (битрейт), k (столбцы плиток), \
                          r (row-mt), n (порог покоя), q (мин. квантователь), \
-                         u (рейт-контроль), l (уровень CQ), а не «{other}»"
+                         m (макс. квантователь), u (рейт-контроль), \
+                         l (уровень CQ), а не «{other}»"
                     ));
                 }
             }
@@ -382,6 +394,10 @@ fn usage() -> &'static str {
                                        смотрит все блоки на каждом кадре
     --rc <cbr|vbr|cq>                  режим рейт-контроля, по умолчанию cbr
     --min-q <0..63>                    нижняя граница квантователя, по умолчанию 4
+    --max-q <0..63>                    верхняя граница, по умолчанию 56. Упирается
+                                       раньше нижней: при масштабе 1 кодер достаёт
+                                       до потолка и промахивается мимо битрейта
+                                       вместо того, чтобы сжать сильнее
     --cq-level <0..63>                 цель качества для --rc cq
     --compare <конф,конф,...>          мерить несколько конфигураций кодера на
                                        ОДНИХ И ТЕХ ЖЕ кадрах, в одном прогоне.
@@ -503,6 +519,12 @@ fn parse_args() -> Result<Args, String> {
             "--static-threshold" => {
                 args.static_threshold =
                     value()?.parse().map_err(|_| "--static-threshold ждёт число")?;
+            }
+            "--max-q" => {
+                args.max_quantizer = value()?.parse().map_err(|_| "--max-q ждёт число")?;
+                if args.max_quantizer > 63 {
+                    return Err("--max-q вне диапазона 0..63".to_owned());
+                }
             }
             "--min-q" => {
                 args.min_quantizer = value()?.parse().map_err(|_| "--min-q ждёт число")?;
@@ -699,6 +721,7 @@ fn encoder_settings(
     settings.row_mt = args.row_mt;
     settings.static_threshold = args.static_threshold;
     settings.min_quantizer = args.min_quantizer;
+    settings.max_quantizer = args.max_quantizer;
     settings.cq_level = args.cq_level;
     settings.rc_mode = RcMode::parse(&args.rc_mode)
         .ok_or(format!("неизвестный режим рейт-контроля: {}", args.rc_mode))?;
@@ -871,6 +894,7 @@ fn build_compare_encoders(
             settings.row_mt = spec.row_mt;
             settings.static_threshold = spec.static_threshold;
             settings.min_quantizer = spec.min_quantizer;
+            settings.max_quantizer = spec.max_quantizer;
             settings.cq_level = spec.cq_level;
             settings.rc_mode = RcMode::parse(&spec.rc_mode)
                 .ok_or(format!("«{}»: неизвестный режим {}", spec.label, spec.rc_mode))?;
@@ -1114,6 +1138,9 @@ fn main() {
             }
             if spec.min_quantizer != 4 {
                 extra.push_str(&format!(", мин. q {}", spec.min_quantizer));
+            }
+            if spec.max_quantizer != 56 {
+                extra.push_str(&format!(", макс. q {}", spec.max_quantizer));
             }
             println!(
                 "  {:<14} {} в {}×{}, {} кбит/с, cpu-used {}, потоков {}{}",
