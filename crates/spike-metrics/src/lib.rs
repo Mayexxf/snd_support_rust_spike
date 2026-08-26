@@ -153,6 +153,13 @@ pub struct FrameStat {
     pub encode_dropped: bool,
     /// The quantizer the encoder chose for this frame, 0..=63.
     pub quantizer: Option<u8>,
+    /// The whole iteration, wait included — everything between one poll and the
+    /// next.
+    ///
+    /// `ИТОГО` is the sum of the stage timers, so it cannot see the work between
+    /// them. Subtracting the wait from this gives the same span measured from
+    /// outside, and the difference is what the stages missed.
+    pub iter_us: u64,
 }
 
 /// Accumulates per-frame statistics over one run.
@@ -169,10 +176,12 @@ pub struct Recorder {
     compare: Latencies,
     encode: Latencies,
     budget: Latencies,
+    outside: Latencies,
     frames_seen: u64,
     frames_new: u64,
     keyframes: u64,
     encode_drops: u64,
+    pointer_only: u64,
     quantizer: Latencies,
     changed_px_total: u128,
     copied_px_total: u128,
@@ -204,10 +213,12 @@ impl Recorder {
             compare: Latencies::default(),
             encode: Latencies::default(),
             budget: Latencies::default(),
+            outside: Latencies::default(),
             frames_seen: 0,
             frames_new: 0,
             keyframes: 0,
             encode_drops: 0,
+            pointer_only: 0,
             quantizer: Latencies::default(),
             changed_px_total: 0,
             copied_px_total: 0,
@@ -235,6 +246,16 @@ impl Recorder {
     /// [`Report::mbps`].
     pub fn note_unpaced(&mut self) {
         self.unpaced = true;
+    }
+
+    /// How many polls found the desktop unchanged but the pointer moved.
+    ///
+    /// Taken from the source at the end of the run rather than per frame,
+    /// because these polls never produce a `FrameStat` — they are exactly the
+    /// ones the loop discards, which is how they came to be counted as a still
+    /// screen in the first place.
+    pub fn note_pointer_only(&mut self, polls: u64) {
+        self.pointer_only = polls;
     }
 
     /// Declare that this run's costs are not what the product would pay, and why.
@@ -301,12 +322,17 @@ impl Recorder {
         // per frame rather than reconstructed from three separate percentiles —
         // the p95 of a sum is not the sum of the p95s.
         if !self.comparing {
-            self.budget.push(
-                stat.work_us
-                    + stat.readback_us
-                    + stat.convert_us
-                    + stat.encode_us.unwrap_or(0),
-            );
+            let staged = stat.work_us
+                + stat.readback_us
+                + stat.convert_us
+                + stat.encode_us.unwrap_or(0);
+            self.budget.push(staged);
+            // The same span measured from outside, minus the wait, minus what
+            // the stages accounted for. Saturating because the two clocks are
+            // read at different points and rounding can put them a microsecond
+            // the wrong way round; that is noise, not negative work.
+            let measured = stat.iter_us.saturating_sub(stat.wait_us);
+            self.outside.push(measured.saturating_sub(staged));
         }
         self.changed_px_total += stat.changed_px as u128;
         self.copied_px_total += stat.copied_px as u128;
@@ -362,10 +388,12 @@ impl Recorder {
             compare: self.compare,
             encode: self.encode,
             budget: self.budget,
+            outside: self.outside,
             frames_seen: self.frames_seen,
             frames_new: self.frames_new,
             keyframes: self.keyframes,
             encode_drops: self.encode_drops,
+            pointer_only: self.pointer_only,
             quantizer: self.quantizer,
             changed_px_total: self.changed_px_total,
             copied_px_total: self.copied_px_total,
@@ -399,11 +427,18 @@ pub struct Report {
     pub compare: Latencies,
     pub encode: Latencies,
     pub budget: Latencies,
+    /// Per frame, the part of the iteration the stage timers did not see.
+    /// See [`FrameStat::iter_us`].
+    pub outside: Latencies,
     pub frames_seen: u64,
     pub frames_new: u64,
     pub keyframes: u64,
     /// Frames the encoder took and emitted nothing for. See [`FrameStat::encode_dropped`].
     pub encode_drops: u64,
+    /// Polls where only the mouse pointer moved. See
+    /// [`spike_capture::FrameSource::pointer_only_polls`] — counted apart from
+    /// still polls because a moving cursor is something the product must send.
+    pub pointer_only: u64,
     /// Quantizer chosen per frame, 0..=63.
     pub quantizer: Latencies,
     pub changed_px_total: u128,
@@ -851,6 +886,19 @@ impl std::fmt::Display for Report {
             "  экран не менялся        {:.1}% опросов",
             self.still_share() * 100.0
         )?;
+        if self.pointer_only > 0 {
+            // Part of the share above, and not idle: the desktop image was the
+            // same but the cursor had moved, and a product has to send that.
+            // Printed apart so the still share is read as what it is — a fact
+            // about the desktop image, not about how much there was to send.
+            let share = self.pointer_only as f64 / self.frames_seen.max(1) as f64;
+            writeln!(
+                s,
+                "  из них двигался курсор  {:.1}% опросов ({}) — экран тот же, а слать есть что",
+                share * 100.0,
+                self.pointer_only
+            )?;
+        }
         if self.frames_new > 0 {
             writeln!(
                 s,
@@ -888,6 +936,14 @@ impl std::fmt::Display for Report {
         }
         if !self.budget.is_empty() {
             writeln!(s, "  ИТОГО на кадр        {}", self.budget.summary_ms())?;
+        }
+        if !self.outside.is_empty() {
+            // What the four stage timers did not see, measured from outside the
+            // whole iteration. Printed because ИТОГО can only ever understate:
+            // it is a sum of stages, and anything between them is invisible to
+            // it. A small number here is the licence to keep reading ИТОГО as
+            // the frame's cost; a large one is not.
+            writeln!(s, "  вне замеров стадий   {}", self.outside.summary_ms())?;
         }
         writeln!(s, "\n  ожидание кадра       {}", self.wait.summary_ms())?;
         writeln!(s, "  (ожидание — не расход: при цели {} к/с так и должно быть)", self.target_fps)?;
@@ -1323,6 +1379,44 @@ mod tests {
         assert_eq!(track.mean_delta_bytes(), Some(1_000));
         assert_eq!(track.mean_keyframe_bytes(), Some(60_000));
         assert_eq!(track.frames, 4);
+    }
+
+    #[test]
+    fn the_stages_are_checked_against_the_whole_iteration() {
+        // ИТОГО is a sum of stage timers and cannot see the work between them,
+        // so it can only understate. The gap is measured rather than assumed.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        r.record(&FrameStat {
+            is_new: true,
+            wait_us: 20_000,
+            work_us: 1_000,
+            readback_us: 2_000,
+            convert_us: 3_000,
+            encode_us: Some(4_000),
+            // Twenty spent waiting, ten inside the stages, and two the stages
+            // never saw.
+            iter_us: 32_000,
+            ..Default::default()
+        });
+        let rep = r.finish(Duration::from_secs(1));
+
+        assert_eq!(rep.budget.percentile(0.50), Some(10_000));
+        assert_eq!(rep.outside.percentile(0.50), Some(2_000));
+    }
+
+    #[test]
+    fn a_frame_whose_clocks_disagree_reports_no_negative_work() {
+        // The two clocks are read at different points, so rounding can put the
+        // iteration a shade under the stages. That is noise, and it must not
+        // wrap a u64.
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        r.record(&FrameStat {
+            is_new: true,
+            work_us: 5_000,
+            iter_us: 4_999,
+            ..Default::default()
+        });
+        assert_eq!(r.finish(Duration::from_secs(1)).outside.percentile(0.50), Some(0));
     }
 
     #[test]

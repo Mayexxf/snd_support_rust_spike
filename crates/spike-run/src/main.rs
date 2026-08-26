@@ -1316,6 +1316,15 @@ fn main() {
                     is_keyframe: encoded.is_some_and(|(_, out)| out.keyframe),
                     encode_dropped: encoded.is_some_and(|(_, out)| out.dropped),
                     quantizer: encoded.and_then(|(_, out)| out.quantizer),
+                    // The whole iteration, wait included. Already measured and
+                    // until now thrown away on every frame that carried content:
+                    // `t0` was read only on the still branch. `ИТОГО` is the sum
+                    // of four stage timers, so everything between them — reading
+                    // the dirty list, building this struct, the loop itself —
+                    // fell outside it, one-sidedly, making every verdict softer
+                    // than the truth. Reported so the gap is visible instead of
+                    // assumed small.
+                    iter_us: t0.elapsed().as_micros() as u64,
                 };
                 rec.record(&stat);
                 frames_done += 1;
@@ -1344,6 +1353,10 @@ fn main() {
         }
     }
 
+    // Asked at the end because these polls never reach the recorder: they are
+    // the ones the loop threw away as "no new frame", which is how a moving
+    // cursor came to be counted as a still screen.
+    rec.note_pointer_only(source.pointer_only_polls());
     let report = rec.finish(started.elapsed());
     println!("{report}");
 

@@ -220,6 +220,21 @@ pub trait FrameSource {
     /// Rebuild after [`CaptureError::AccessLost`].
     fn reinit(&mut self) -> Result<(), CaptureError>;
 
+    /// Polls so far where the desktop image was unchanged but the mouse pointer
+    /// had moved.
+    ///
+    /// These arrive as "no new frame" and were counted as a still screen, which
+    /// answers the question "how long was the desktop static" — not the question
+    /// the product asks, which is "how long was there nothing to send". A moving
+    /// cursor is something to send. The two differ by however much the user
+    /// moves the mouse, and the share of still polls is the number the whole
+    /// encoding budget rests on.
+    ///
+    /// Zero for every source that has no cursor to report.
+    fn pointer_only_polls(&self) -> u64 {
+        0
+    }
+
     /// Why this source's per-frame costs are not what the product would pay.
     ///
     /// `None` for a live screen, which is the only source entitled to a verdict.

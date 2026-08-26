@@ -29,7 +29,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIFactory1, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
@@ -65,6 +66,9 @@ pub struct DdaSource {
     applied: Option<Vec<Rect>>,
     /// Scratch for the dirty-rect metadata the API writes into.
     rect_scratch: Vec<RECT>,
+    /// Scratch for the move-rect metadata, which is a different and larger
+    /// struct and therefore cannot share the buffer above.
+    move_scratch: Vec<DXGI_OUTDUPL_MOVE_RECT>,
     dirty: Vec<Rect>,
     buf: Vec<u8>,
     stride: usize,
@@ -76,6 +80,8 @@ pub struct DdaSource {
     /// full one however the caller asked. Without this the first frame after a
     /// UAC prompt would be three quarters uninitialised memory.
     force_full: bool,
+    /// Polls where only the pointer moved. See `FrameSource::pointer_only_polls`.
+    pointer_only: u64,
     /// Frames copied so far. Only used to alternate path order in comparison
     /// runs, so wrapping is fine.
     frames_done: u64,
@@ -190,6 +196,8 @@ impl DdaSource {
                 pending: None,
                 applied: None,
                 rect_scratch: Vec::new(),
+                move_scratch: Vec::new(),
+                pointer_only: 0,
                 dirty: Vec::new(),
                 buf: Vec::new(),
                 stride: 0,
@@ -208,7 +216,23 @@ impl DdaSource {
         self.dupl.clone().ok_or(CaptureError::AccessLost)
     }
 
-    /// Collect the dirty rectangles the API reported for this frame.
+    /// Collect everything the API says changed in this frame.
+    ///
+    /// Desktop Duplication reports change in **two** lists, and content
+    /// described by the first does not appear in the second. Move rectangles
+    /// name a block that was blitted from one place on the desktop to another —
+    /// scrolling a document, dragging a window — and dirty rectangles name
+    /// everything repainted. Reading only the dirty list, as this did until
+    /// now, understated the changed area by the whole of every scroll and left
+    /// the moved pixels out of the partial copy entirely, so the CPU-side buffer
+    /// drifted away from the screen exactly while the user was doing the thing
+    /// the harness was built to measure.
+    ///
+    /// The destination rectangle of a move is treated as changed, which makes
+    /// the copy correct at the cost of moving those pixels across the bus. A
+    /// product would blit them within the CPU buffer instead and pay nothing;
+    /// that is an optimisation to measure later, not a licence to report the
+    /// area as unchanged now.
     ///
     /// When the driver supplies no metadata the answer is [`Dirty::Unknown`],
     /// not an empty list: an empty list would read as "nothing changed" and
@@ -218,14 +242,58 @@ impl DdaSource {
             return Dirty::Unknown;
         }
 
-        let need = info.TotalMetadataBufferSize as usize / size_of::<RECT>() + 1;
-        if self.rect_scratch.len() < need {
-            self.rect_scratch.resize(need, RECT::default());
+        // The size comes from the driver and is used to size an allocation, so
+        // it is bounded before it is believed. A frame cannot plausibly carry
+        // more rectangles than it has scanlines by a wide margin; anything past
+        // that is a bad value, and treating it as "no usable metadata" is the
+        // same answer this function already gives for a driver that reports
+        // none.
+        const MAX_METADATA_BYTES: u32 = 4 * 1024 * 1024;
+        if info.TotalMetadataBufferSize > MAX_METADATA_BYTES {
+            return Dirty::Unknown;
+        }
+        let total = info.TotalMetadataBufferSize as usize;
+
+        // Each list is read into its own buffer, so each is sized for the whole
+        // metadata budget. Over-allocating by the other list's share costs a few
+        // kilobytes once and removes the need to track where one ends.
+        let need_rects = total / size_of::<RECT>() + 1;
+        if self.rect_scratch.len() < need_rects {
+            self.rect_scratch.resize(need_rects, RECT::default());
+        }
+        let need_moves = total / size_of::<DXGI_OUTDUPL_MOVE_RECT>() + 1;
+        if self.move_scratch.len() < need_moves {
+            self.move_scratch.resize(need_moves, DXGI_OUTDUPL_MOVE_RECT::default());
         }
 
         let Ok(dupl) = self.dupl() else {
             return Dirty::Unknown;
         };
+
+        self.dirty.clear();
+
+        // Moves first, matching the order the API lays them out in. A driver
+        // that reports none returns zero bytes rather than an error, and a
+        // driver that fails the call leaves the frame described by its dirty
+        // rectangles alone — worse than the truth, but not wrong about what it
+        // does say.
+        let mut move_bytes: u32 = 0;
+        let move_capacity = (self.move_scratch.len() * size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32;
+        // SAFETY: the buffer holds at least `move_capacity` bytes and
+        // `move_bytes` is a live u32; both outlive the call.
+        let moved = unsafe {
+            dupl.GetFrameMoveRects(move_capacity, self.move_scratch.as_mut_ptr(), &mut move_bytes)
+        };
+        if moved.is_ok() {
+            let count = move_bytes as usize / size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+            self.dirty.extend(self.move_scratch[..count].iter().map(|m| Rect {
+                left: m.DestinationRect.left,
+                top: m.DestinationRect.top,
+                right: m.DestinationRect.right,
+                bottom: m.DestinationRect.bottom,
+            }));
+        }
+
         let mut required: u32 = 0;
         let capacity = (self.rect_scratch.len() * size_of::<RECT>()) as u32;
         // SAFETY: the buffer is at least `capacity` bytes and `required` is a
@@ -238,7 +306,6 @@ impl DdaSource {
         }
 
         let count = required as usize / size_of::<RECT>();
-        self.dirty.clear();
         self.dirty.extend(self.rect_scratch[..count].iter().map(|r| Rect {
             left: r.left,
             top: r.top,
@@ -656,7 +723,14 @@ impl FrameSource for DdaSource {
 
         // LastPresentTime of zero means only the mouse pointer moved; the desktop
         // image is unchanged. The frame still has to be released.
+        //
+        // Counted on the way out, because "the desktop did not change" and
+        // "there was nothing to send" are not the same claim and this harness
+        // was making the second one out of the first. A product has to send a
+        // moved cursor; folding these into the still count credits the encoding
+        // budget with idle time that is not idle.
         if info.LastPresentTime == 0 {
+            self.pointer_only += 1;
             // SAFETY: a frame was successfully acquired above.
             let _ = unsafe { dupl.ReleaseFrame() };
             return Ok(None);
@@ -739,6 +813,10 @@ impl FrameSource for DdaSource {
             ));
         }
         out
+    }
+
+    fn pointer_only_polls(&self) -> u64 {
+        self.pointer_only
     }
 
     fn reinit(&mut self) -> Result<(), CaptureError> {
