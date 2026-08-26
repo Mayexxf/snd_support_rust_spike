@@ -21,6 +21,16 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 
 use crate::{CaptureError, Dirty, Frame, FrameSource, Readback};
 
+/// The one thing an operator has to know about this backend.
+///
+/// A constant rather than a literal inside `caveats` so that the prose test in
+/// the crate root can reach it. That test exists because a broken line
+/// continuation has twice left indentation stranded mid-sentence — and it never
+/// caught this string, which carried fourteen spaces in the middle of it for as
+/// long as it existed, because a `GdiSource` cannot be constructed on a machine
+/// without a desktop and the test therefore never looked.
+pub(crate) const NO_DIRTY_RECTS: &str = "GDI не сообщает изменившиеся области — частичное копирование здесь невозможно, каждый кадр копируется целиком";
+
 pub struct GdiSource {
     screen: HDC,
     mem: HDC,
@@ -201,10 +211,7 @@ impl FrameSource for GdiSource {
     }
 
     fn caveats(&self) -> Vec<String> {
-        vec![
-            "GDI не сообщает изменившиеся области — частичное копирование здесь              невозможно, каждый кадр копируется целиком"
-                .to_owned(),
-        ]
+        vec![NO_DIRTY_RECTS.to_owned()]
     }
 
     fn reinit(&mut self) -> Result<(), CaptureError> {

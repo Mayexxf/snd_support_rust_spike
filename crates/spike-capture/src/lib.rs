@@ -344,10 +344,20 @@ mod prose_tests {
             None,
         )));
 
+        // The two live backends cannot be constructed here — they need a
+        // desktop — so their operator-facing text is reached as constants
+        // instead. It was not reached at all until now, and one of those
+        // strings had been carrying fourteen spaces mid-sentence since the day
+        // it was written.
+        let mut loose: Vec<String> = Vec::new();
+        #[cfg(windows)]
+        loose.push(gdi::NO_DIRTY_RECTS.to_owned());
+
         for source in &sources {
             let mut strings = vec![source.describe()];
             strings.extend(source.caveats());
             strings.extend(source.stand_in());
+            strings.append(&mut loose.clone());
             for text in strings {
                 for line in text.lines() {
                     assert!(!line.contains("  "), "два пробела подряд: {line:?}");
