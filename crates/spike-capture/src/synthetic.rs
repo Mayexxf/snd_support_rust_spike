@@ -197,6 +197,16 @@ impl FrameSource for SyntheticSource {
         }))
     }
 
+    fn stand_in(&self) -> Option<String> {
+        Some(
+            concat!(
+                "Это нарисованная картинка, а не экран: ни захвата,\n",
+                "ни копирования из памяти GPU здесь нет вовсе."
+            )
+            .to_owned(),
+        )
+    }
+
     fn reinit(&mut self) -> Result<(), CaptureError> {
         self.frame_no = 0;
         self.next_due = None;

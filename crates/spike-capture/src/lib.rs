@@ -200,6 +200,16 @@ pub trait FrameSource {
     /// Rebuild after [`CaptureError::AccessLost`].
     fn reinit(&mut self) -> Result<(), CaptureError>;
 
+    /// Why this source's per-frame costs are not what the product would pay.
+    ///
+    /// `None` for a live screen, which is the only source entitled to a verdict.
+    /// Anything else understates the budget in ways that are structural rather
+    /// than incidental, and the report has to refuse the tick mark rather than
+    /// print a flattering one.
+    fn stand_in(&self) -> Option<String> {
+        None
+    }
+
     /// Reasons this source's numbers do not describe the machine we care about.
     ///
     /// Separate from [`FrameSource::describe`] because these have to be shouted,
@@ -254,5 +264,46 @@ mod tests {
         // backend, and the encoder pays for the rectangles it is handed.
         assert_eq!(d.area(1920, 1080), 200);
         assert_eq!(d.count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod prose_tests {
+    use super::*;
+
+    /// Every operator-facing string, checked for the whitespace that a broken
+    /// line continuation leaves behind.
+    ///
+    /// This has now bitten the project twice, both times the same way: a `\`
+    /// continuation inside a Rust literal, written through a tool that consumed
+    /// the backslash itself and left the indentation in the string. The result
+    /// reads as a stutter in the middle of a sentence and looks like a bug in
+    /// the measurement rather than in the prose.
+    #[test]
+    fn no_operator_facing_string_has_runaway_whitespace() {
+        let mut sources: Vec<Box<dyn FrameSource>> = vec![Box::new(
+            synthetic::SyntheticSource::new(64, 64, synthetic::Motion::Scroll, 30),
+        )];
+        let shot = shot::Shot { width: 64, height: 64, bgra: vec![128; 64 * 64 * 4] };
+        sources.push(Box::new(image::ImageSource::from_shot(
+            shot,
+            "тест".to_owned(),
+            image::Scenario::Scroll,
+            8,
+            None,
+        )));
+
+        for source in &sources {
+            let mut strings = vec![source.describe()];
+            strings.extend(source.caveats());
+            strings.extend(source.stand_in());
+            for text in strings {
+                for line in text.lines() {
+                    assert!(!line.contains("  "), "два пробела подряд: {line:?}");
+                    assert_eq!(line.trim_end(), line, "пробел в конце строки: {line:?}");
+                }
+                assert!(!text.contains("\n\n"), "пустая строка внутри: {text:?}");
+            }
+        }
     }
 }

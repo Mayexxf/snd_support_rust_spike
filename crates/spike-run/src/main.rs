@@ -790,6 +790,9 @@ fn main() {
     let mut rotate = 0usize;
 
     let mut rec = Recorder::new(format!("Захват · {}", source.describe()), w, h, args.fps);
+    if let Some(why) = source.stand_in() {
+        rec.note_stand_in(why);
+    }
     for (label, tw, th) in track_labels {
         rec.add_track(label, tw, th);
     }

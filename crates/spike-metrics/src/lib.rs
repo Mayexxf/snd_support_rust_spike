@@ -162,6 +162,7 @@ pub struct Recorder {
     cpu_start: cpu::CpuSnapshot,
     tracks: Vec<Track>,
     comparing: bool,
+    stand_in: Option<String>,
 }
 
 impl Recorder {
@@ -193,7 +194,23 @@ impl Recorder {
             cpu_start: cpu::CpuSnapshot::now(),
             tracks: Vec::new(),
             comparing: false,
+            stand_in: None,
         }
+    }
+
+    /// Declare that this run's costs are not what the product would pay, and why.
+    ///
+    /// Set for any source that is not a live screen. The budget column then
+    /// stops carrying a verdict: measured against a screenshot it read 69% and
+    /// "nearly keeps up" for a configuration the live desktop had priced at 116%
+    /// and "does not". Two reasons, both structural — copying is a memcpy rather
+    /// than a read across the bus, and a scripted translation has none of the
+    /// irregular moments a real scroll puts in the tail.
+    ///
+    /// A number that flatters is worse than no number, and a tick mark next to
+    /// it is worse still.
+    pub fn note_stand_in(&mut self, why: impl Into<String>) {
+        self.stand_in = Some(why.into());
     }
 
     /// Add one encoder configuration to a comparison run.
@@ -302,6 +319,7 @@ impl Recorder {
             reinits: self.reinits,
             cpu,
             tracks: self.tracks,
+            stand_in: self.stand_in,
         }
     }
 }
@@ -337,6 +355,9 @@ pub struct Report {
     /// Encoder configurations measured side by side on identical frames.
     /// Empty outside a comparison run.
     pub tracks: Vec<Track>,
+    /// Why this run's per-frame budget is not what the product would pay.
+    /// `None` for a live screen, which is the only source that earns a verdict.
+    pub stand_in: Option<String>,
 }
 
 impl Report {
@@ -768,7 +789,15 @@ impl std::fmt::Display for Report {
             if let (Some(p50), Some(p95)) = (self.budget_share(0.50), self.budget_share(0.95)) {
                 writeln!(s, "  занято p50 / p95        {:.0}% / {:.0}%", p50 * 100.0, p95 * 100.0)?;
             }
-            writeln!(s, "  {} {}", v.mark(), v.explain())?;
+            match &self.stand_in {
+                Some(why) => {
+                    writeln!(s, "  ~ Вердикта не будет: бюджет здесь занижен.")?;
+                    for line in why.lines() {
+                        writeln!(s, "    {line}")?;
+                    }
+                }
+                None => writeln!(s, "  {} {}", v.mark(), v.explain())?,
+            }
         } else if !self.budget.is_empty() {
             writeln!(s, "\n-- Бюджет кадра --")?;
             writeln!(
@@ -849,6 +878,12 @@ impl std::fmt::Display for Report {
                     _ => "—".to_owned(),
                 };
                 let bud = match (t.budget_share(0.95, interval), t.verdict(interval)) {
+                    // A stand-in source gets the number but never the mark: the
+                    // number is comparable between rows, the mark would be a
+                    // verdict this run is not entitled to give.
+                    (Some(share), _) if self.stand_in.is_some() => {
+                        format!("{:.0}% ~", share * 100.0)
+                    }
                     (Some(share), Some(v)) => format!("{:.0}% {}", share * 100.0, v.mark()),
                     // Enough samples to divide, not enough for the division to
                     // mean anything. Saying so beats a confident tick.
@@ -915,6 +950,17 @@ impl std::fmt::Display for Report {
                 s,
                 "  «Бюджет» — во что обошлась бы эта конфигурация, будь она одна."
             )?;
+            if let Some(why) = &self.stand_in {
+                writeln!(s, "\n  ~ Бюджет здесь ЗАНИЖЕН и вердиктом не является.")?;
+                for line in why.lines() {
+                    writeln!(s, "    {line}")?;
+                }
+                writeln!(
+                    s,
+                    "  Строки сравнимы между собой и с такой же таблицей на другой машине;"
+                )?;
+                writeln!(s, "  «проходит или нет» решается прогоном по живому столу.")?;
+            }
             if frames < MIN_FRAMES_FOR_VERDICT as u64 {
                 writeln!(
                     s,

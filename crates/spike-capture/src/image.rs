@@ -458,6 +458,17 @@ impl FrameSource for ImageSource {
         Ok(())
     }
 
+    fn stand_in(&self) -> Option<String> {
+        Some(
+            concat!(
+                "Копирование — memcpy из памяти, а не чтение через шину GPU.\n",
+                "Заданное движение дешевле живой прокрутки: на том же содержимом\n",
+                "живой экран дал p95 кодирования на треть больше."
+            )
+            .to_owned(),
+        )
+    }
+
     fn caveats(&self) -> Vec<String> {
         vec![concat!(
             "Это снимок, а не живой экран: движение задано скриптом.\n",
