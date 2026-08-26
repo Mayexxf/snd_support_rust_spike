@@ -1,12 +1,18 @@
 //! What machine produced these numbers.
 //!
 //! This module exists because of how phase 0 is actually run: first on a VM to
-//! prove the harness works, then once on the target Celeron. Two runs, two very
+//! prove the harness works, then on the target itself. Two runs, two very
 //! different meanings, and a report that does not say which is which invites
 //! exactly one mistake — reading VM numbers as an answer about the target.
 //!
 //! So the report leads with the machine, and states plainly whether its numbers
 //! transfer.
+//!
+//! The target is an Intel N100 (Alder Lake-N, four cores, AVX2), not the Celeron
+//! N3150 this was first aimed at. The change inverts one assumption written all
+//! over the old text: the baseline numbers come from a Xeon E5-2696 v2, which
+//! has AVX and no AVX2, so the target is now the machine with the wider vector
+//! unit, not the one short of it.
 
 /// Everything worth knowing about the machine under measurement.
 #[derive(Debug, Clone, Default)]
@@ -16,9 +22,15 @@ pub struct Machine {
     pub cores: usize,
     /// `None` on architectures where the question does not apply.
     pub has_avx: Option<bool>,
+    pub has_avx2: Option<bool>,
     pub has_sse42: Option<bool>,
     /// Hypervisor vendor string, when the CPU says it is running under one.
     pub hypervisor: Option<String>,
+    /// True when the hypervisor named above runs *under* this machine rather
+    /// than over it — the Hyper-V root partition. Windows 11 enters it whenever
+    /// VBS is on, which is the default, so the vendor string alone proves
+    /// nothing about whether these numbers came from real hardware.
+    pub root_partition: bool,
     pub os: String,
 }
 
@@ -27,42 +39,70 @@ pub struct Machine {
 pub enum Caveat {
     Virtualised(String),
     ForeignArch(&'static str),
-    /// The target CPU (Braswell) has SSE4.2 and no AVX. A machine with AVX will
-    /// flatter a software encoder that the target cannot run the same way.
-    HasAvx,
+    /// Not the target machine. Not an error — runs elsewhere are still worth
+    /// making, they just mean nothing until divided by a run on the target over
+    /// the same snapshot.
+    NotTargetCpu { here: String },
     FewerCores { here: usize, target: usize },
 }
 
-/// Cores on the reference target, an Intel Celeron N3150.
+/// Cores on the reference target, an Intel N100.
 pub const TARGET_CORES: usize = 4;
+
+/// How the target CPU names itself, as a substring of its CPUID brand string.
+/// Matched rather than compared whole: the brand carries clock and padding that
+/// vary between steppings, and none of that changes which machine this is.
+pub const TARGET_CPU_MARK: &str = "N100";
+
+/// First build number of Windows 11. `ProductName` in the registry still reads
+/// "Windows 10 Pro" on 11 — Microsoft never updated the value — so the build is
+/// the only thing that tells the two apart.
+#[cfg(windows)]
+const WINDOWS_11_FIRST_BUILD: u32 = 22000;
 
 impl Machine {
     pub fn detect() -> Self {
+        let hv = hypervisor();
         Self {
             cpu_brand: cpu_brand(),
             arch: std::env::consts::ARCH,
             cores: std::thread::available_parallelism().map_or(0, |n| n.get()),
             has_avx: feature("avx"),
+            has_avx2: feature("avx2"),
             has_sse42: feature("sse4.2"),
-            hypervisor: hypervisor(),
+            root_partition: hv.as_ref().is_some_and(|h| h.root_partition),
+            hypervisor: hv.map(|h| h.vendor),
             os: os_description(),
         }
     }
 
     /// Reasons this run does not stand in for a run on the target machine.
     ///
-    /// An empty list does not certify the machine *is* a Celeron N3150 — it only
+    /// An empty list does not certify the machine *is* the target — it only
     /// says nothing detectable disqualifies it.
     pub fn caveats(&self) -> Vec<Caveat> {
         let mut out = Vec::new();
+        // The bare hypervisor bit stopped meaning "virtual machine". Windows 11
+        // turns VBS on by default, which puts the OS in the Hyper-V root
+        // partition, and the bit is then set on ordinary hardware — measured on
+        // the target, which is a desktop with no Hyper-V role installed.
+        //
+        // Only positive proof of the root partition clears the flag, never the
+        // absence of proof: the two mistakes are not symmetrical. Calling the
+        // target a VM is noise. Calling a VM the target is the single error this
+        // module was written to prevent.
         if let Some(vendor) = &self.hypervisor {
-            out.push(Caveat::Virtualised(vendor.clone()));
+            if !self.root_partition {
+                out.push(Caveat::Virtualised(vendor.clone()));
+            }
         }
         if self.arch != "x86_64" {
             out.push(Caveat::ForeignArch(self.arch));
         }
-        if self.has_avx == Some(true) {
-            out.push(Caveat::HasAvx);
+        if let Some(brand) = &self.cpu_brand {
+            if !brand.contains(TARGET_CPU_MARK) {
+                out.push(Caveat::NotTargetCpu { here: brand.clone() });
+            }
         }
         if self.cores > 0 && self.cores < TARGET_CORES {
             out.push(Caveat::FewerCores { here: self.cores, target: TARGET_CORES });
@@ -82,13 +122,22 @@ impl Machine {
             self.arch, self.cores
         ));
         s.push_str(&format!(
-            "  наборы инструкций       SSE4.2 {}, AVX {}\n",
+            "  наборы инструкций       SSE4.2 {}, AVX {}, AVX2 {}\n",
             yes_no(self.has_sse42),
-            yes_no(self.has_avx)
+            yes_no(self.has_avx),
+            yes_no(self.has_avx2)
         ));
         s.push_str(&format!("  система                 {}\n", self.os));
         if let Some(v) = &self.hypervisor {
-            s.push_str(&format!("  гипервизор              {v}\n"));
+            // Which side of the hypervisor this machine is on decides whether
+            // the rest of the report means anything, so it is printed, not left
+            // for the reader to infer from the vendor string.
+            let side = if self.root_partition {
+                " (корневой раздел — железо настоящее, гипервизор от VBS)"
+            } else {
+                " (гость)"
+            };
+            s.push_str(&format!("  гипервизор              {v}{side}\n"));
         }
 
         let caveats = self.caveats();
@@ -116,9 +165,10 @@ impl Caveat {
                 "архитектура {arch}, а целевая — x86_64. Если это ARM-хост, \
                  x86-код идёт через эмуляцию и замер скорости бессмыслен"
             ),
-            Caveat::HasAvx => "у процессора есть AVX, а у целевого Braswell его нет. \
-                 Программный кодер здесь получит фору, которой на целевой машине не будет"
-                .to_owned(),
+            Caveat::NotTargetCpu { here } => format!(
+                "процессор {here}, а целевой — Intel N100. Числа отсюда значат \
+                 что-то только после деления на прогон по тому же снимку на цели"
+            ),
             Caveat::FewerCores { here, target } => format!(
                 "ядер {here}, а на целевой машине {target}"
             ),
@@ -138,6 +188,7 @@ fn yes_no(v: Option<bool>) -> &'static str {
 fn feature(name: &str) -> Option<bool> {
     Some(match name {
         "avx" => is_x86_feature_detected!("avx"),
+        "avx2" => is_x86_feature_detected!("avx2"),
         "sse4.2" => is_x86_feature_detected!("sse4.2"),
         _ => return None,
     })
@@ -192,11 +243,19 @@ fn cpu_brand() -> Option<String> {
     None
 }
 
+/// A hypervisor, and which side of it this code is running on.
+struct Hypervisor {
+    vendor: String,
+    root_partition: bool,
+}
+
 #[cfg(target_arch = "x86_64")]
-fn hypervisor() -> Option<String> {
-    // ECX bit 31 of leaf 1 is the "hypervisor present" bit. Real silicon leaves
-    // it clear; every mainstream hypervisor sets it, and none of them has a
-    // reason to lie in the direction that matters here.
+fn hypervisor() -> Option<Hypervisor> {
+    // ECX bit 31 of leaf 1 is the "hypervisor present" bit. It used to be enough
+    // on its own — real silicon left it clear. It does not any more: Windows 11
+    // turns VBS on by default, the OS then runs in the Hyper-V root partition,
+    // and the bit is set on a plain desktop. Measured on the target: bit set,
+    // vendor "Microsoft Hv", no Hyper-V role installed, LarkBox X mainboard.
     if cpuid(1).ecx & (1 << 31) == 0 {
         return None;
     }
@@ -212,11 +271,32 @@ fn hypervisor() -> Option<String> {
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_owned();
 
-    Some(if vendor.is_empty() { "неизвестный".to_owned() } else { vendor })
+    let root_partition = vendor == HYPER_V && r.eax >= 0x4000_0003 && {
+        // Hyper-V publishes the partition's privileges in leaf 0x40000003.
+        // Creating partitions and managing CPUs are the root's jobs and a guest
+        // is not granted them. Read only under Hyper-V, because the leaf means
+        // something else entirely under other vendors.
+        //
+        // Measured on the target: EBX = 0x002bb9ff, both bits set.
+        const CREATE_PARTITIONS: u32 = 1 << 0;
+        const CPU_MANAGEMENT: u32 = 1 << 12;
+        const ROOT_ONLY: u32 = CREATE_PARTITIONS | CPU_MANAGEMENT;
+        cpuid(0x4000_0003).ebx & ROOT_ONLY == ROOT_ONLY
+    };
+
+    Some(Hypervisor {
+        vendor: if vendor.is_empty() { "неизвестный".to_owned() } else { vendor },
+        root_partition,
+    })
 }
 
+/// Leaf 0x40000000's vendor string for Hyper-V, and for the Windows 11 VBS
+/// hypervisor, which is the same thing wearing a different hat.
+#[cfg(target_arch = "x86_64")]
+const HYPER_V: &str = "Microsoft Hv";
+
 #[cfg(not(target_arch = "x86_64"))]
-fn hypervisor() -> Option<String> {
+fn hypervisor() -> Option<Hypervisor> {
     None
 }
 
@@ -238,8 +318,22 @@ fn os_description() -> String {
     let product: String = key.get_value("ProductName").unwrap_or_default();
     let display: String = key.get_value("DisplayVersion").unwrap_or_default();
     let build: String = key.get_value("CurrentBuild").unwrap_or_default();
+    windows_name(&product, &display, &build)
+}
 
-    let mut s = if product.is_empty() { "Windows".to_owned() } else { product };
+/// Assemble the OS name from the three registry values that describe it.
+///
+/// Split out from the registry read because the interesting part is not reading
+/// the key — it is knowing that `ProductName` lies. On Windows 11 it still reads
+/// "Windows 10 Pro"; measured on the target, which reports exactly that at build
+/// 22631. Left uncorrected, every report from a Windows 11 machine names the
+/// wrong OS, and these reports exist to be compared across machines.
+#[cfg(windows)]
+fn windows_name(product: &str, display: &str, build: &str) -> String {
+    let mut s = if product.is_empty() { "Windows".to_owned() } else { product.to_owned() };
+    if build.parse::<u32>().is_ok_and(|b| b >= WINDOWS_11_FIRST_BUILD) {
+        s = s.replace("Windows 10", "Windows 11");
+    }
     if !display.is_empty() {
         s.push_str(&format!(" {display}"));
     }
@@ -271,24 +365,82 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_avx_is_flagged() {
-        let m = Machine { has_avx: Some(true), arch: "x86_64", cores: 4, ..Default::default() };
-        assert!(m.caveats().contains(&Caveat::HasAvx));
+    fn a_machine_that_is_not_the_target_says_which_one_it_is() {
+        // The baseline numbers come from this one, so the caveat has to name it
+        // rather than just deny it.
+        let m = Machine {
+            cpu_brand: Some("Intel(R) Xeon(R) CPU E5-2696 v2 @ 2.50GHz".to_owned()),
+            arch: "x86_64",
+            cores: 4,
+            ..Default::default()
+        };
+        let caveats = m.caveats();
+        assert!(
+            caveats.iter().any(|c| matches!(c, Caveat::NotTargetCpu { .. })),
+            "{caveats:?}"
+        );
+        assert!(m.render().contains("E5-2696"));
     }
 
     #[test]
-    fn a_braswell_shaped_machine_is_not_flagged() {
+    fn an_n100_shaped_machine_is_not_flagged() {
         let m = Machine {
-            cpu_brand: Some("Intel(R) Celeron(R) CPU N3150 @ 1.60GHz".to_owned()),
+            cpu_brand: Some("Intel(R) N100".to_owned()),
             arch: "x86_64",
             cores: 4,
-            has_avx: Some(false),
+            has_avx: Some(true),
+            has_avx2: Some(true),
             has_sse42: Some(true),
-            hypervisor: None,
-            os: "Windows 10".to_owned(),
+            // What the target actually reports: VBS is on, so the hypervisor bit
+            // is set, and the partition privileges say this side is the root.
+            hypervisor: Some("Microsoft Hv".to_owned()),
+            root_partition: true,
+            os: "Windows 11 Pro 23H2 (сборка 22631)".to_owned(),
         };
         assert!(m.caveats().is_empty(), "{:?}", m.caveats());
         assert!(m.render().contains("показательными"));
+    }
+
+    #[test]
+    fn the_root_partition_is_not_a_virtual_machine() {
+        // Same vendor string, opposite meaning. Before this distinction existed
+        // every run on the target printed "ЦИФРЫ НЕ ПЕРЕНОСЯТСЯ" about itself.
+        let root = Machine {
+            arch: "x86_64",
+            cores: 4,
+            hypervisor: Some("Microsoft Hv".to_owned()),
+            root_partition: true,
+            ..Default::default()
+        };
+        assert!(
+            !root.caveats().iter().any(|c| matches!(c, Caveat::Virtualised(_))),
+            "{:?}",
+            root.caveats()
+        );
+        assert!(root.render().contains("железо настоящее"));
+
+        let guest = Machine { root_partition: false, ..root };
+        assert!(guest.caveats().iter().any(|c| matches!(c, Caveat::Virtualised(_))));
+        assert!(guest.render().contains("(гость)"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_eleven_is_not_reported_as_windows_ten() {
+        // Exactly what the target's registry holds. ProductName was never
+        // updated for 11, so only the build number separates them.
+        assert_eq!(
+            windows_name("Windows 10 Pro", "23H2", "22631"),
+            "Windows 11 Pro 23H2 (сборка 22631)"
+        );
+        // And a real Windows 10 must not be renamed: the baseline machine is
+        // build 19045, and its reports are read next to the target's.
+        assert_eq!(
+            windows_name("Windows 10 Pro", "22H2", "19045"),
+            "Windows 10 Pro 22H2 (сборка 19045)"
+        );
+        // A build number that will not parse must not silently rename anything.
+        assert_eq!(windows_name("Windows 10 Pro", "", ""), "Windows 10 Pro");
     }
 
     #[test]
