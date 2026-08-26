@@ -12,7 +12,11 @@
 
 use std::time::{Duration, Instant};
 
-use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, synthetic};
+use std::path::{Path, PathBuf};
+
+use spike_capture::image::{ImageSource, Scenario};
+use spike_capture::shot::Shot;
+use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
 use spike_encode::{Codec, convert::I420};
 use spike_metrics::{FrameStat, Recorder, TrackStat, env::Machine};
 
@@ -89,8 +93,22 @@ mod timer {
 
 struct Args {
     source: String,
-    motion: synthetic::Motion,
+    /// Kept as text: the synthetic desktop and a real screenshot understand
+    /// different scenario names, and which one applies is not known until the
+    /// source is chosen.
+    motion: String,
     seconds: u64,
+    /// Stop after this many frames of content, whatever the clock says.
+    ///
+    /// The point of the whole exercise is dividing one machine's number by
+    /// another's, and that only works if both encoded the same frames. A
+    /// sixty-second run gives 422 frames here and maybe a hundred on the target
+    /// — different frames, different content, nothing to divide.
+    frames: Option<u64>,
+    /// Capture one frame to a file and stop.
+    grab: Option<PathBuf>,
+    /// Scroll step for a screenshot source, in pixels per frame.
+    step: u32,
     fps: u32,
     width: u32,
     height: u32,
@@ -113,8 +131,11 @@ impl Default for Args {
             // development Mac and a locked-down VM both land on synthetic without
             // the operator having to know that in advance.
             source: "auto".to_owned(),
-            motion: synthetic::Motion::Scroll,
+            motion: "scroll".to_owned(),
             seconds: DEFAULT_SECONDS,
+            frames: None,
+            grab: None,
+            step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
             height: 1080,
@@ -229,7 +250,16 @@ fn usage() -> &'static str {
     spike [ключи]
 
     --source <auto|dda|gdi|synthetic>  источник кадров (по умолчанию auto)
-    --motion <still|cursor|scroll|full> что «происходит» на синтетическом экране
+    --source image:<файл>              снимок экрана, движется по сценарию
+    --motion <сценарий>                что происходит на экране:
+                                       синтетический — still, cursor, scroll, full
+                                       снимок — still, caret, edit, scroll, drag
+    --grab <файл>                      снять один кадр в файл и выйти
+    --step <N>                         шаг прокрутки снимка, пикселей за кадр
+    --frames <N>                       остановиться после N кадров с содержимым.
+                                       Для сравнения машин между собой: обе должны
+                                       закодировать одну и ту же последовательность.
+                                       Со снимком отключает выдержку темпа
     --seconds <N>                      длительность прогона (по умолчанию 30)
     --fps <N>                          целевая частота (по умолчанию 30)
     --size <ШxВ>                       размер для синтетического источника
@@ -267,6 +297,13 @@ fn usage() -> &'static str {
 
     spike --compare vp9:s2:t2,vp9:s2:t4,vp8:s2 --seconds 60
     spike --compare vp9:s1,vp9:s2,vp9:s3,vp9:s4 --seconds 60
+
+Сравнение МАШИН между собой — через снимок, одинаковый на обеих:
+
+    spike --grab heavy.shot                       снять один раз, где есть
+    spike --source image:heavy.shot --motion scroll --frames 300 --compare vp9:s2
+
+Снимок не коммитится: это кадр настоящего стола, а репозиторий публичный.
 "
 }
 
@@ -282,10 +319,20 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--source" => args.source = value()?,
-            "--motion" => {
-                let v = value()?;
-                args.motion = synthetic::Motion::parse(&v)
-                    .ok_or(format!("неизвестное движение: {v}"))?;
+            "--motion" => args.motion = value()?,
+            "--frames" => {
+                let n: u64 = value()?.parse().map_err(|_| "--frames ждёт число")?;
+                if n == 0 {
+                    return Err("--frames 0 — нечего мерить".to_owned());
+                }
+                args.frames = Some(n);
+            }
+            "--grab" => args.grab = Some(PathBuf::from(value()?)),
+            "--step" => {
+                args.step = value()?.parse().map_err(|_| "--step ждёт число")?;
+                if args.step == 0 {
+                    return Err("--step 0 — это сценарий still".to_owned());
+                }
             }
             "--seconds" => {
                 args.seconds = value()?.parse().map_err(|_| "--seconds ждёт число")?;
@@ -342,17 +389,23 @@ fn parse_args() -> Result<Args, String> {
 /// Build the requested source, saying plainly what happened when the preferred
 /// one is unavailable.
 fn build_source(args: &Args) -> Result<Box<dyn FrameSource>, String> {
-    let synthetic = || -> Box<dyn FrameSource> {
-        Box::new(synthetic::SyntheticSource::new(
+    let synthetic = || -> Result<Box<dyn FrameSource>, String> {
+        let motion = synthetic::Motion::parse(&args.motion)
+            .ok_or(format!("синтетический источник не знает движения «{}»", args.motion))?;
+        Ok(Box::new(synthetic::SyntheticSource::new(
             args.width,
             args.height,
-            args.motion,
+            motion,
             args.fps,
-        ))
+        )))
     };
 
+    if let Some(path) = args.source.strip_prefix("image:") {
+        return build_image(args, Path::new(path));
+    }
+
     match args.source.as_str() {
-        "synthetic" => Ok(synthetic()),
+        "synthetic" => synthetic(),
         "dda" => open_dda().map_err(|e| format!("DDA не открылась: {e}")),
         "gdi" => open_gdi().map_err(|e| format!("GDI не открылась: {e}")),
         "auto" => match open_dda() {
@@ -364,13 +417,74 @@ fn build_source(args: &Args) -> Result<Box<dyn FrameSource>, String> {
                     Err(gdi_err) => {
                         eprintln!("· GDI тоже недоступна ({gdi_err}); беру синтетический источник");
                         eprintln!("  Это проверка стенда, а НЕ замер захвата экрана.");
-                        Ok(synthetic())
+                        synthetic()
                     }
                 }
             }
         },
         other => Err(format!("неизвестный источник: {other}")),
     }
+}
+
+/// A saved screenshot, moved on a fixed script.
+///
+/// Pacing is dropped whenever `--frames` is given: with a fixed number of
+/// frames the run is a benchmark, and waiting out a 33 ms interval on a fast
+/// machine would only hide how fast it is.
+fn build_image(args: &Args, path: &Path) -> Result<Box<dyn FrameSource>, String> {
+    let scenario = Scenario::parse(&args.motion).ok_or(format!(
+        "снимок не знает сценария «{}». Есть still, caret, edit, scroll, drag",
+        args.motion
+    ))?;
+    let interval = args
+        .frames
+        .is_none()
+        .then(|| Duration::from_secs_f64(1.0 / args.fps.max(1) as f64));
+    ImageSource::open(path, scenario, args.step, interval)
+        .map(|s| Box::new(s) as Box<dyn FrameSource>)
+        .map_err(|e| format!("{e}"))
+}
+
+/// Take one frame and write it out, then stop.
+///
+/// Whatever `--source` says is what gets grabbed, so a synthetic frame can be
+/// saved on a machine with no desktop duplication — which is how the replay path
+/// gets tested without Windows.
+fn grab(args: &Args, path: &Path) -> Result<(), String> {
+    let mut source = build_source(args)?;
+    println!("Источник: {}", source.describe());
+    println!("Снимаю один кадр в {} …", path.display());
+    println!("Если ничего не происходит — пошевелите мышью: пока экран не меняется,");
+    println!("захват честно не отдаёт ни одного кадра.");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match source.next_frame(Duration::from_millis(200), Readback::Full) {
+            Ok(Some(frame)) => {
+                let Some(bgra) = frame.bgra else {
+                    return Err("захват не отдал пиксели".to_owned());
+                };
+                let (w, h, stride) = (frame.width, frame.height, frame.stride);
+                Shot::save(path, w, h, stride, bgra)?;
+                let shot = Shot::load(path)?;
+                let fp = shot.fingerprint();
+                println!("\nСнято: {w}×{h}, {} МБ", shot.bgra.len() / 1_048_576);
+                println!("  отпечаток {}  ({})", fp.short(), fp.describe());
+                if args.source.starts_with("synthetic") {
+                    println!("\nЭто синтетический кадр, а не рабочий стол: годится только для");
+                    println!("проверки самого стенда.");
+                } else {
+                    println!("\nЭто кадр настоящего рабочего стола. В git он не попадёт —");
+                    println!("расширения .shot, .raw и .bgra в .gitignore. Возите файлом.");
+                }
+                return Ok(());
+            }
+            Ok(None) => continue,
+            Err(CaptureError::AccessLost) => source.reinit().map_err(|e| e.to_string())?,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("за 10 секунд экран ни разу не изменился, снимать нечего".to_owned())
 }
 
 #[cfg(windows)]
@@ -516,6 +630,14 @@ fn main() {
         std::process::exit(2);
     }
 
+    if let Some(path) = args.grab.clone() {
+        if let Err(e) = grab(&args, &path) {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // The machine comes first, before any number, so a VM run cannot be mistaken
     // for a target run further down the page.
     let machine = Machine::detect();
@@ -535,8 +657,16 @@ fn main() {
     let (w, h) = source.dimensions();
     println!("\n=== Источник ===\n  {}", source.describe());
     println!("  {}", _timer.describe());
-    for caveat in source.caveats() {
-        println!("\n  ⚠ {caveat}");
+    let caveats = source.caveats();
+    if !caveats.is_empty() {
+        println!();
+        for caveat in caveats {
+            // A caveat may be several lines. Only the first is marked; the rest
+            // line up under it instead of each shouting again.
+            for (i, line) in caveat.lines().enumerate() {
+                println!("{}{line}", if i == 0 { "  ⚠ " } else { "    " });
+            }
+        }
     }
     println!();
     println!(
@@ -663,12 +793,25 @@ fn main() {
     for (label, tw, th) in track_labels {
         rec.add_track(label, tw, th);
     }
+
+    // A frame budget makes the run a benchmark: both machines encode the same
+    // sequence and the two numbers can be divided. The clock stays as a backstop
+    // so a still scenario cannot hang waiting for content that never comes.
+    let frame_budget = args.frames.unwrap_or(u64::MAX);
+    let mut frames_done = 0u64;
+    if let Some(n) = args.frames {
+        println!(
+            "Остановка после {} с содержимым; {} с — предохранитель.",
+            spike_metrics::plural(n, "кадра", "кадров", "кадров"),
+            args.seconds
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     // One frame interval, so a still screen blocks instead of spinning.
     let timeout = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
     let started = Instant::now();
 
-    'run: while Instant::now() < deadline {
+    'run: while Instant::now() < deadline && frames_done < frame_budget {
         let t0 = Instant::now();
         match source.next_frame(timeout, args.readback) {
             Ok(Some(frame)) => {
@@ -767,6 +910,7 @@ fn main() {
                     is_keyframe: encoded.is_some_and(|(_, out)| out.keyframe),
                 };
                 rec.record(&stat);
+                frames_done += 1;
             }
             Ok(None) => rec.record(&FrameStat {
                 wait_us: t0.elapsed().as_micros() as u64,

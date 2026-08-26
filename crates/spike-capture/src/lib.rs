@@ -17,6 +17,8 @@
 //! the questions phase 0 was set up to answer. The runner counts it and
 //! reinitialises.
 
+pub mod image;
+pub mod shot;
 pub mod synthetic;
 
 #[cfg(windows)]
