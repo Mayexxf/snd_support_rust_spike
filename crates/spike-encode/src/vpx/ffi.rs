@@ -76,6 +76,13 @@ pub const VP8E_SET_STATIC_THRESHOLD: c_int = 17;
 /// byte counts alone, because this number was not being read.
 pub const VP8E_GET_LAST_QUANTIZER_64: c_int = 20;
 pub const VP8E_SET_CQ_LEVEL: c_int = 25;
+/// VP8's own screen-content switch, and the counterpart of
+/// [`VP9E_SET_TUNE_CONTENT`].
+///
+/// VP9 has been told the picture is a desktop since the codec was wired in;
+/// VP8 never was. Every VP8-against-VP9 number in this repository was therefore
+/// measuring, in part, a setting one side had and the other did not.
+pub const VP8E_SET_SCREEN_CONTENT_MODE: c_int = 31;
 pub const VP9E_SET_TILE_COLUMNS: c_int = 33;
 pub const VP9E_SET_TUNE_CONTENT: c_int = 43;
 pub const VP9E_SET_ROW_MT: c_int = 55;

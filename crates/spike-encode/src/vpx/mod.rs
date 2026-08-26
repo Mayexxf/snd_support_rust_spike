@@ -245,6 +245,22 @@ impl VpxEncoder {
             enc.control(ffi::VP9E_SET_TILE_COLUMNS, settings.tile_columns as c_int)?;
             enc.control(ffi::VP9E_SET_ROW_MT, c_int::from(settings.row_mt))?;
         }
+        // The same thing said in VP8's vocabulary. It was never said, so every
+        // comparison between the two codecs here has been partly a comparison
+        // between a codec told what it was looking at and one that was not.
+        //
+        // Mode 1 is "on". The header offers a 2 — "on with more aggressive rate
+        // control" — which is aimed squarely at this content and is not sent
+        // here: one change at a time, and the first question is what VP8 does
+        // when it is merely told the truth.
+        //
+        // The failure is not swallowed. Tolerating a refusal would leave no way
+        // to tell "the hint was applied" from "the hint was refused", and the
+        // whole reason this line exists is that a difference between the two
+        // codecs turned out to be a setting one of them never received.
+        if codec == Codec::Vp8 {
+            enc.control(ffi::VP8E_SET_SCREEN_CONTENT_MODE, 1)?;
+        }
         // Meaningless outside CQ, and libvpx rejects it for VP9 in some builds
         // rather than ignoring it, so it is only sent when it is asked for.
         if settings.rc_mode == RcMode::Cq {
