@@ -113,6 +113,8 @@ struct Args {
     grab: Option<PathBuf>,
     /// Encode, decode and write three pictures under this prefix, then stop.
     dump: Option<PathBuf>,
+    /// Withhold this frame from the decoder, to see what a lost packet costs.
+    drop_frame: Option<u64>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -156,6 +158,7 @@ impl Default for Args {
             frames: None,
             grab: None,
             dump: None,
+            drop_frame: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -412,6 +415,9 @@ fn usage() -> &'static str {
                                        раньше нижней: при масштабе 1 кодер достаёт
                                        до потолка и промахивается мимо битрейта
                                        вместо того, чтобы сжать сильнее
+    --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
+                                       показывает, что видит получатель после
+                                       потерянного пакета и надолго ли
     --error-resilient <0|1>            пережить потерю кадра, по умолчанию 0.
                                        Ноль был зашит и не назывался выбором:
                                        без этого одна потеря даёт кашу до
@@ -474,6 +480,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--grab" => args.grab = Some(PathBuf::from(value()?)),
             "--dump" => args.dump = Some(PathBuf::from(value()?)),
+            "--drop-frame" => {
+                let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
+                args.drop_frame = Some(n);
+            }
             "--step" => {
                 args.step = value()?.parse().map_err(|_| "--step ждёт число")?;
                 if args.step == 0 {
@@ -813,6 +823,7 @@ fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
     let mut payload: Vec<u8> = Vec::new();
     let mut last = None;
     let mut done = 0u64;
+    let mut decode_failures = 0u64;
 
     let deadline = Instant::now() + Duration::from_secs(120);
     while done < want && Instant::now() < deadline {
@@ -842,14 +853,51 @@ fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
 
         payload.clear();
         let out = enc.encode_keeping(p, &mut payload)?;
-        if !payload.is_empty() {
-            if let Some(d) = decoder.decode(&payload)? {
-                decoded = Some(d);
+        // A lost packet, simulated the only honest way available here: the
+        // encoder is not told, the decoder simply never sees this frame. That
+        // is what a drop on the wire looks like from both ends.
+        //
+        // What happens next is the whole question. Without error resilience VP9
+        // keeps adapting its entropy contexts from the last frame it decoded, so
+        // the two sides part company here and stay parted until a keyframe. With
+        // it, they should converge again. Neither had ever been looked at.
+        let lost = args.drop_frame == Some(done);
+        if lost {
+            println!("  кадр {done} потерян — декодеру не отдан");
+        }
+        if !payload.is_empty() && !lost {
+            // A decode failure is reported and stepped over rather than ending
+            // the run. A receiver does not get to stop: the next frame arrives
+            // whether or not the last one made sense, and the question this mode
+            // exists to answer is how many frames it takes to make sense again.
+            //
+            // Measured: after one withheld frame, a stream encoded without
+            // error resilience fails here on every single frame that follows,
+            // to the end of the run. It is not a degraded picture, it is a dead
+            // stream.
+            match decoder.decode(&payload) {
+                Ok(Some(d)) => decoded = Some(d),
+                Ok(None) => {}
+                Err(e) => {
+                    decode_failures += 1;
+                    if decode_failures == 1 {
+                        println!("  кадр {done}: {e}");
+                    }
+                }
             }
         }
         last = Some(out);
         source_frame = Some((w, h, stride, bgra));
         done += 1;
+    }
+
+    if decode_failures > 0 {
+        println!(
+            "  декодер не справился с {decode_failures} кадрами из {done} после потери — \
+             то есть поток не восстановился сам"
+        );
+    } else if args.drop_frame.is_some() {
+        println!("  после потери декодер справился со всеми остальными кадрами");
     }
 
     let Some((w, h, stride, bgra)) = source_frame else {
