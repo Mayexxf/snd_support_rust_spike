@@ -189,7 +189,18 @@ pub struct Report {
     pub width: usize,
     pub height: usize,
     /// Share of source pixels that are edges. Constant-ish per content, printed
-    /// because a measure over 2% of the frame deserves saying so out loud.
+    /// because a measure that ignores most of the frame has to say how much.
+    ///
+    /// On `heavy.shot` it is **53.8%**, not the couple of per cent this comment
+    /// used to claim. That is not the mask failing — the content is dense code
+    /// text with no wallpaper and no photograph, 41% of it is ink and 55% is
+    /// exactly the page white, so more than half the pixels genuinely sit on or
+    /// beside a stroke. It is still a stroke mask: 89% of ink pixels are kept
+    /// against 29% of the rest.
+    ///
+    /// What it does mean is that this share is a property of the content, and
+    /// the measure has never been run on an ordinary desktop — wallpaper,
+    /// photographs, window chrome. Nobody knows what it does there.
     pub edge_share: f64,
     /// Per threshold: the share of edge pixels damaged, at p50 and p95 across
     /// frames.
