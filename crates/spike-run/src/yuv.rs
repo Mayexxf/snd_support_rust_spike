@@ -89,12 +89,23 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// `provenance` goes into the header as an `XSPIKE` parameter.
+    ///
+    /// Y4M lets a writer add its own `X`-prefixed parameters and every reader
+    /// is required to ignore the ones it does not know, so this survives being
+    /// handed to ffmpeg. It exists because neither exported format recorded
+    /// which run produced it: two files that differ only in `--step` or
+    /// `--motion` were indistinguishable once written, and the whole comparison
+    /// method rests on knowing that two files hold the same frames.
+    ///
+    /// Must contain no whitespace — the header is space-separated.
     pub fn create(
         path: &Path,
         layout: Layout,
         width: u32,
         height: u32,
         fps: u32,
+        provenance: &str,
     ) -> Result<Self, String> {
         let file = File::create(path)
             .map_err(|e| format!("не создать {}: {e}", path.display()))?;
@@ -123,7 +134,12 @@ impl Writer {
             // range tag is read as limited by every tool that matters. Saying
             // `pc` would shift everything by sixteen and the shift would be
             // charged to whichever encoder was on trial.
-            let header = format!("YUV4MPEG2 W{width} H{height} F{fps}:1 Ip A1:1 C420jpeg\n");
+            let tag: String = provenance
+                .chars()
+                .map(|c| if c.is_whitespace() { '_' } else { c })
+                .collect();
+            let header =
+                format!("YUV4MPEG2 W{width} H{height} F{fps}:1 Ip A1:1 C420jpeg XSPIKE{tag}\n");
             w.put(header.as_bytes())?;
         }
         Ok(w)
@@ -181,6 +197,22 @@ impl Writer {
     /// over every byte of them.
     pub fn finish(mut self) -> Result<(u64, u64, String), String> {
         self.out.flush().map_err(|e| format!("не сбросить буфер: {e}"))?;
+        // One syscall against the count this writer has been keeping. A short
+        // write, a full disk or a truncated flush otherwise produces a file that
+        // decodes to fewer frames than the report says it wrote — and the whole
+        // comparison method rests on two files holding the same frames.
+        let on_disk = self
+            .out
+            .get_ref()
+            .metadata()
+            .map_err(|e| format!("не проверить длину файла: {e}"))?
+            .len();
+        if on_disk != self.bytes {
+            return Err(format!(
+                "записано {} Б, а на диске {on_disk} Б — файл неполон",
+                self.bytes
+            ));
+        }
         let short = format!("{:016x}", self.hash)[..8].to_owned();
         Ok((self.frames, self.bytes, short))
     }
@@ -214,14 +246,18 @@ mod tests {
         let path = dir.join("one.y4m");
 
         let p = plane(64, 32);
-        let mut w = Writer::create(&path, Layout::Y4m, p.width, p.height, 30).unwrap();
+        let mut w = Writer::create(&path, Layout::Y4m, p.width, p.height, 30, "тест").unwrap();
         w.frame(&p).unwrap();
         let (frames, _, _) = w.finish().unwrap();
         assert_eq!(frames, 1);
 
         let got = std::fs::read(&path).unwrap();
-        let head = b"YUV4MPEG2 W64 H32 F30:1 Ip A1:1 C420jpeg\n";
-        assert!(got.starts_with(head), "заголовок не тот");
+        let head = b"YUV4MPEG2 W64 H32 F30:1 Ip A1:1 C420jpeg XSPIKE\xd1\x82\xd0\xb5\xd1\x81\xd1\x82\n";
+        assert!(
+            got.starts_with(head),
+            "заголовок не тот: {}",
+            String::from_utf8_lossy(&got[..head.len().min(got.len())])
+        );
 
         let body = &got[head.len()..];
         assert!(body.starts_with(b"FRAME\n"));
@@ -240,7 +276,7 @@ mod tests {
         let path = dir.join("one.nv12");
 
         let p = plane(64, 32);
-        let mut w = Writer::create(&path, Layout::Nv12, p.width, p.height, 30).unwrap();
+        let mut w = Writer::create(&path, Layout::Nv12, p.width, p.height, 30, "тест").unwrap();
         w.frame(&p).unwrap();
         w.finish().unwrap();
 
@@ -256,13 +292,57 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Whitespace in the tag would end the parameter early and ffmpeg would read
+    /// the rest as parameters of its own.
+    #[test]
+    fn provenance_with_spaces_cannot_break_the_header() {
+        let dir = std::env::temp_dir().join("spike-y4m-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prov.y4m");
+
+        let p = plane(64, 32);
+        let mut w =
+            Writer::create(&path, Layout::Y4m, p.width, p.height, 30, "image:a b\tc").unwrap();
+        w.frame(&p).unwrap();
+        w.finish().unwrap();
+
+        let got = std::fs::read(&path).unwrap();
+        let line: Vec<u8> = got.iter().copied().take_while(|&b| b != b'\n').collect();
+        let text = String::from_utf8(line).unwrap();
+        assert!(text.ends_with("XSPIKEimage:a_b_c"), "{text}");
+        // Nine parameters and no more: a stray space would make ten.
+        assert_eq!(text.split(' ').count(), 8, "{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Two runs differing only in the key that decides the content must not
+    /// produce files that look the same.
+    #[test]
+    fn two_steps_leave_different_headers() {
+        let dir = std::env::temp_dir().join("spike-y4m-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = plane(64, 32);
+
+        let mut heads = Vec::new();
+        for step in ["step40", "step80"] {
+            let path = dir.join(format!("{step}.y4m"));
+            let mut w = Writer::create(&path, Layout::Y4m, p.width, p.height, 30, step).unwrap();
+            w.frame(&p).unwrap();
+            w.finish().unwrap();
+            let got = std::fs::read(&path).unwrap();
+            heads.push(got.iter().copied().take_while(|&b| b != b'\n').collect::<Vec<u8>>());
+            std::fs::remove_file(&path).ok();
+        }
+        assert_ne!(heads[0], heads[1]);
+    }
+
     #[test]
     fn a_frame_of_the_wrong_size_is_refused_rather_than_appended() {
         let dir = std::env::temp_dir().join("spike-y4m-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mismatch.y4m");
 
-        let mut w = Writer::create(&path, Layout::Y4m, 64, 32, 30).unwrap();
+        let mut w = Writer::create(&path, Layout::Y4m, 64, 32, 30, "тест").unwrap();
         let other = plane(32, 16);
         let err = w.frame(&other).unwrap_err();
         assert!(err.contains("не совпадает"), "{err}");
@@ -277,11 +357,11 @@ mod tests {
         let b = dir.join("b.y4m");
 
         let p = plane(64, 32);
-        let mut w = Writer::create(&a, Layout::Y4m, p.width, p.height, 30).unwrap();
+        let mut w = Writer::create(&a, Layout::Y4m, p.width, p.height, 30, "тест").unwrap();
         w.frame(&p).unwrap();
         let (_, _, fa) = w.finish().unwrap();
 
-        let mut w = Writer::create(&b, Layout::Y4m, p.width, p.height, 30).unwrap();
+        let mut w = Writer::create(&b, Layout::Y4m, p.width, p.height, 30, "тест").unwrap();
         w.frame(&p).unwrap();
         let (_, _, fb) = w.finish().unwrap();
         assert_eq!(fa, fb, "одни и те же кадры — один и тот же отпечаток");
@@ -290,7 +370,7 @@ mod tests {
         // claim two files hold the same frames.
         let mut q = plane(64, 32);
         q.y[0] ^= 1;
-        let mut w = Writer::create(&b, Layout::Y4m, q.width, q.height, 30).unwrap();
+        let mut w = Writer::create(&b, Layout::Y4m, q.width, q.height, 30, "тест").unwrap();
         w.frame(&q).unwrap();
         let (_, _, fq) = w.finish().unwrap();
         assert_ne!(fa, fq);

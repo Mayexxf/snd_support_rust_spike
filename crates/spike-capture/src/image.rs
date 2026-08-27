@@ -202,6 +202,29 @@ impl ImageSource {
         self.fingerprint
     }
 
+    /// How many distinct pictures a scrolling scenario can ever show.
+    ///
+    /// The window wraps within itself, so the offset advances modulo the window
+    /// height and comes back round after `win_h / gcd(step, win_h)` steps. At
+    /// the default 60 pixels into a 648-pixel window that is **54** — a
+    /// 300-frame run is fifty-four pictures shown five and a half times each,
+    /// and by the third repeat the encoder has every one of them in its
+    /// reference frames.
+    ///
+    /// That is not a defect, it is a property, and it was invisible: the settle
+    /// measurement showed later stops resolving instantly and the reason was
+    /// this, not the codec. Printed so nobody has to rediscover it. A step
+    /// coprime to the window height — 61 rather than 60 — visits all 648.
+    ///
+    /// `None` for scenarios that do not scroll.
+    pub fn period(&self) -> Option<u32> {
+        if !matches!(self.scenario, Scenario::Scroll | Scenario::Settle) {
+            return None;
+        }
+        let win_h = (self.window.bottom - self.window.top).max(1) as u32;
+        Some(win_h / gcd(self.step % win_h.max(1), win_h))
+    }
+
     fn whole(&self) -> Rect {
         Rect { left: 0, top: 0, right: self.shot.width as i32, bottom: self.shot.height as i32 }
     }
@@ -348,6 +371,13 @@ impl ImageSource {
 /// Advances through the first [`SETTLE_SCROLL`] frames of each cycle and then
 /// stands still for the rest of it. A free function rather than a method because
 /// both the dirty-rect decision and the render need it, and they must agree.
+fn gcd(a: u32, b: u32) -> u32 {
+    if a == 0 {
+        return b.max(1);
+    }
+    gcd(b % a, a)
+}
+
 fn settle_offset_steps(n: u64) -> u64 {
     let cycles = n / SETTLE_CYCLE;
     let within = n % SETTLE_CYCLE;
@@ -430,14 +460,25 @@ fn contains(r: &Rect, x: i32, y: i32) -> bool {
 
 impl FrameSource for ImageSource {
     fn describe(&self) -> String {
-        format!(
+        // The fingerprint identifies the screenshot file and nothing else — it
+        // is FNV over the still image, so it is the same whatever the scenario
+        // does with it. The step and the period have to be stated separately or
+        // two runs over different content look identical on the page.
+        let mut s = format!(
             "снимок «{}» {}×{}, сценарий {}, отпечаток {}",
             self.name,
             self.shot.width,
             self.shot.height,
             self.scenario.name(),
             self.fingerprint.short()
-        )
+        );
+        if let Some(period) = self.period() {
+            s.push_str(&format!(
+                ", шаг {} пикс/кадр, период {period} кадров",
+                self.step
+            ));
+        }
+        s
     }
 
     fn dimensions(&self) -> (u32, u32) {
@@ -771,6 +812,33 @@ mod tests {
             moving, scrolled,
             "выброси тихие кадры — и settle это ровно scroll, до байта"
         );
+    }
+
+    /// The number that explained the settle measurement's warm cache, and which
+    /// nothing printed. A step sharing a factor with the window height visits
+    /// only a fraction of the possible pictures.
+    #[test]
+    fn the_period_says_how_few_distinct_pictures_a_scroll_has() {
+        // 320×240 stand-in: the window is 60% of the height, so 144 rows.
+        let sixty = ImageSource::from_shot(shot(320, 240), "т".to_owned(), Scenario::Scroll, 60, None);
+        assert_eq!(sixty.period(), Some(144 / 12), "gcd(60,144)=12");
+
+        // Coprime to the window height: every offset appears.
+        let coprime = ImageSource::from_shot(shot(320, 240), "т".to_owned(), Scenario::Scroll, 61, None);
+        assert_eq!(coprime.period(), Some(144));
+
+        // A still screen has no period at all.
+        let still = ImageSource::from_shot(shot(320, 240), "т".to_owned(), Scenario::Still, 60, None);
+        assert_eq!(still.period(), None);
+    }
+
+    /// Two runs differing only in `--step` used to print character-identical
+    /// descriptions while measuring different content.
+    #[test]
+    fn the_description_distinguishes_two_steps() {
+        let a = ImageSource::from_shot(shot(320, 240), "т".to_owned(), Scenario::Scroll, 40, None);
+        let b = ImageSource::from_shot(shot(320, 240), "т".to_owned(), Scenario::Scroll, 80, None);
+        assert_ne!(a.describe(), b.describe(), "{}", a.describe());
     }
 
     #[test]

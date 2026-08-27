@@ -31,6 +31,10 @@ mod ivf;
 /// it scores anything ffmpeg can decode — ours and everyone else's alike.
 mod quality;
 
+/// One number saying which frames a run saw and in which order. See the module
+/// for the collapse it exists to make impossible.
+mod chain;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -406,7 +410,14 @@ fn usage() -> &'static str {
                                        «читается ли текст», на который таблицы
                                        не отвечают
     --step <N>                         шаг прокрутки снимка, пикселей за кадр
-    --frames <N>                       остановиться после N кадров с содержимым.
+    --frames <N>                       остановиться после N кадров ВРЕМЕННОЙ ШКАЛЫ,
+                                       считая те, в которых экран не менялся.
+                                       Одинаково во всех режимах — замер, --dump,
+                                       --export-yuv, --emit-ivf, — чтобы одни и те
+                                       же ключи покрывали один и тот же отрезок
+                                       сценария. Раньше замер считал только кадры
+                                       с содержимым, и на settle это расходилось
+                                       втрое.
                                        Для сравнения машин между собой: обе должны
                                        закодировать одну и ту же последовательность.
                                        Со снимком отключает выдержку темпа
@@ -740,6 +751,16 @@ fn build_image(args: &Args, path: &Path) -> Result<Box<dyn FrameSource>, String>
 /// rate reached the file, and listing encoder keys would suggest otherwise.
 fn stamp(args: &Args, encoded: bool) -> String {
     let mut s = format!("  сборка стенда  {}\n", env!("SPIKE_BUILD"));
+    s.push_str(&format!("  источник       {}\n", args.source));
+    // The three keys that decide WHICH frames these are, as opposed to how they
+    // were treated. --step was the one that reached no printed line anywhere:
+    // two runs differing only in it produced character-identical headers while
+    // measuring different content, and the step size matters more than it looks
+    // — a translation the motion search can follow is nearly free and one it
+    // cannot is coded from scratch.
+    s.push_str(&format!("  сценарий       {}\n", args.motion));
+    s.push_str(&format!("  шаг прокрутки  {} пикс/кадр\n", args.step));
+    s.push_str(&format!("  кадров         {}\n", args.frames.unwrap_or(300)));
     s.push_str(&format!("  масштаб        {}\n", args.scale));
     s.push_str(&format!("  темп в файле   {} к/с\n", args.fps));
     if encoded {
@@ -820,9 +841,15 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
         layout.name()
     );
 
-    let mut writer = yuv::Writer::create(path, layout, plane.width, plane.height, args.fps)?;
+    let provenance = format!(
+        "{}:{}:step{}:scale{}",
+        args.source, args.motion, args.step, args.scale
+    );
+    let mut writer =
+        yuv::Writer::create(path, layout, plane.width, plane.height, args.fps, &provenance)?;
     let mut done = 0u64;
     let mut have = false;
+    let mut chain = chain::Chain::new();
     let deadline = Instant::now() + Duration::from_secs(300);
 
     while done < want && Instant::now() < deadline {
@@ -844,6 +871,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
                 // there and wrong here.
                 let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
                 plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+                chain.content(&bgra);
                 have = true;
             }
             // The screen did not change. That is a frame on the timeline, not a
@@ -851,7 +879,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
             // byte-identical to `scroll`: the still frames vanished and what was
             // left was one unbroken scroll. Every scenario with quiet frames was
             // silently having its time compressed the same way.
-            None if have => {}
+            None if have => chain.quiet(),
             None => continue,
         }
 
@@ -866,6 +894,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
     let (frames, bytes, fingerprint) = writer.finish()?;
     println!("\nЗаписано: {frames} кадров, {} МБ", bytes / 1_048_576);
     println!("  отпечаток кадров {fingerprint}");
+    println!("{}", chain.render());
     println!("\nЧем это снято:");
     print!("{}", stamp(args, false));
     println!("\nЭто ровно те плоскости, которые получил бы наш кодер при --scale {}.", args.scale);
@@ -940,6 +969,7 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let mut done = 0u64;
     let mut keyframes = 0u64;
     let mut have = false;
+    let mut chain = chain::Chain::new();
     let deadline = Instant::now() + Duration::from_secs(600);
 
     while done < want && Instant::now() < deadline {
@@ -959,13 +989,14 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
                 // regions the measured path converts.
                 let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
                 plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+                chain.content(&bgra);
                 have = true;
             }
             // A quiet screen is a frame the encoder still gets, and it has to
             // get it here or the question this file exists to answer cannot be
             // asked: whether the picture improves while nothing moves. Skipping
             // these made `settle` produce the very same bytes as `scroll`.
-            None if have => {}
+            None if have => chain.quiet(),
             None => continue,
         }
 
@@ -1013,8 +1044,28 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     println!("  {kbps:.0} кбит/с при {} к/с, {:.0} Б на кадр", args.fps, bytes as f64 / frames as f64);
     println!("  ключевых кадров {keyframes}");
     println!("  отпечаток битстрима {fingerprint}");
+    println!("{}", chain.render());
     println!("\nЧем это снято:");
     print!("{}", stamp(args, true));
+
+    // IVF has no room for a comment, so the provenance goes in a file beside it.
+    // A sidecar can be separated from what it describes — which is why the same
+    // facts are also printed and why the chain is in both — but a file that
+    // records nothing about which run produced it cannot be checked at all, and
+    // that is the state every exported artefact was in.
+    let side = path.with_extension("ivf.txt");
+    // A UTF-8 BOM, because Windows reads a BOM-less UTF-8 text file as ANSI and
+    // renders every Russian word in this file as mojibake. The same trap already
+    // cost this project a mangled PowerShell script.
+    let mut note = String::from("\u{feff}");
+    note.push_str(&stamp(args, true));
+    note.push_str(&format!("  отпечаток битстрима {fingerprint}\n"));
+    note.push_str(&chain.render());
+    note.push('\n');
+    match std::fs::write(&side, note) {
+        Ok(()) => println!("  происхождение записано в {}", side.display()),
+        Err(e) => eprintln!("· не записать {}: {e}", side.display()),
+    }
     println!("\nЭто наш кодер на наших настройках. Чтобы число легло на ту же ось,");
     println!("что и чужие кодеки, декодируйте файл и сравните с --export-yuv тех же");
     println!("кадров: содержимое совпадёт до байта, а разойдётся только качество.");
@@ -1196,6 +1247,7 @@ fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
     let mut last = None;
     let mut done = 0u64;
     let mut decode_failures = 0u64;
+    let mut chain = chain::Chain::new();
 
     let deadline = Instant::now() + Duration::from_secs(120);
     while done < want && Instant::now() < deadline {
@@ -1210,7 +1262,26 @@ fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(e.to_string()),
         };
-        let Some((w, h, stride, bgra)) = grabbed else { continue };
+        // A quiet screen is a frame the encoder still receives, exactly as in
+        // the export paths and for the same reason: skipping it silently turns
+        // `--motion settle` into `--motion scroll`, and the picture this mode
+        // writes out for a settle run was a mid-scroll frame — the one moment
+        // the scenario exists to look past. `--drop-frame N` counted the same
+        // way and so numbered content frames, not the timeline.
+        let (w, h, stride, bgra) = match grabbed {
+            Some(f) => {
+                chain.content(&f.3);
+                source_frame = Some(f.clone());
+                f
+            }
+            None => match &source_frame {
+                Some(f) => {
+                    chain.quiet();
+                    f.clone()
+                }
+                None => continue,
+            },
+        };
 
         if plane.is_none() {
             let p = I420::new(w, h, args.scale);
@@ -1303,6 +1374,7 @@ fn dump(args: &Args, prefix: &Path) -> Result<(), String> {
     )?;
 
     println!("\nКадров закодировано: {done}, последний — {} Б{}", last.bytes, if last.keyframe { ", ключевой" } else { "" });
+    println!("{}", chain.render());
     println!("  {}  источник {w}×{h}", src.display());
     println!("  {}  вход кодера {}×{}", enc_path.display(), plane.width, plane.height);
     println!("  {}  выход декодера {}×{}", dec_path.display(), decoded.width, decoded.height);
@@ -1730,10 +1802,11 @@ fn main() {
     // sequence and the two numbers can be divided. The clock stays as a backstop
     // so a still scenario cannot hang waiting for content that never comes.
     let frame_budget = args.frames.unwrap_or(u64::MAX);
-    let mut frames_done = 0u64;
+    let mut polls_done = 0u64;
+    let mut chain = chain::Chain::new();
     if let Some(n) = args.frames {
         println!(
-            "Остановка после {} с содержимым; {} с — предохранитель.",
+            "Остановка после {} шкалы (считая тихие); {} с — предохранитель.",
             spike_metrics::plural(n, "кадра", "кадров", "кадров"),
             args.seconds
         );
@@ -1743,7 +1816,7 @@ fn main() {
     let timeout = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
     let started = Instant::now();
 
-    'run: while Instant::now() < deadline && frames_done < frame_budget {
+    'run: while Instant::now() < deadline && polls_done < frame_budget {
         let t0 = Instant::now();
         match source.next_frame(timeout, args.readback) {
             Ok(Some(frame)) => {
@@ -1765,6 +1838,12 @@ fn main() {
                         _ => std::slice::from_ref(&whole),
                     };
                     first_frame = false;
+                    // Folded here, before the timed stages, and cheap enough
+                    // not to disturb them: a strided sample is a couple of
+                    // microseconds against stages costing milliseconds. It
+                    // lands outside every stage timer, so it shows up in «вне
+                    // замеров стадий» and nowhere else.
+                    chain.content(bgra);
 
                     if specs.is_empty() {
                         let t = Instant::now();
@@ -1869,13 +1948,29 @@ fn main() {
                     iter_us: t0.elapsed().as_micros() as u64,
                 };
                 rec.record(&stat);
-                frames_done += 1;
+                polls_done += 1;
             }
-            Ok(None) => rec.record(&FrameStat {
-                wait_us: t0.elapsed().as_micros() as u64,
-                is_new: false,
-                ..Default::default()
-            }),
+            Ok(None) => {
+                // A quiet poll is a tick of the timeline and is counted as one.
+                //
+                // It used not to be, and `--frames` therefore meant two
+                // different things: content frames in the measured run, timeline
+                // frames in the exports. On a scenario where every poll carries
+                // content — which is every scenario this project had measured
+                // until `settle` existed — the two coincide and nothing showed.
+                // On `settle` they diverge by a factor of three, so a measured
+                // run and an export given identical flags covered different
+                // stretches of the same scenario and produced chains that could
+                // not be compared. The report prints both counts, so nothing is
+                // lost by counting the honest one here.
+                chain.quiet();
+                polls_done += 1;
+                rec.record(&FrameStat {
+                    wait_us: t0.elapsed().as_micros() as u64,
+                    is_new: false,
+                    ..Default::default()
+                });
+            }
             Err(CaptureError::AccessLost) => {
                 // Expected on a live machine: lock screen, UAC prompt, resolution
                 // change. Counted, not fatal.
@@ -1903,6 +1998,11 @@ fn main() {
     rec.note_moved(moved_px, moved_rects);
     let report = rec.finish(started.elapsed());
     println!("{report}");
+    // The same line every other mode prints, so two runs — or a run and an
+    // export — can be checked against each other by eye rather than by
+    // noticing that some unrelated figure happens to coincide.
+    println!("-- Что видел прогон --");
+    println!("{}", chain.render());
 
     if report.frames_new == 0 {
         println!("\n⚠ Ни одного кадра с содержимым. Экран был статичен весь прогон,");

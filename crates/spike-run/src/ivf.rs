@@ -126,6 +126,23 @@ impl Writer {
             .write_all(&count.to_le_bytes())
             .map_err(|e| format!("не записать счётчик кадров: {e}"))?;
         self.out.flush().map_err(|e| format!("файл не дописан: {e}"))?;
+        // Header, twelve bytes of framing per frame, and the payload. Checked
+        // against the file itself, because a bitstream that is short by one
+        // frame decodes into a sequence that no longer lines up with the source
+        // it will be scored against — and a misaligned score is the one that
+        // comes out flattering rather than absurd.
+        let expected = u64::from(HEADER_BYTES) + self.frames * 12 + self.payload;
+        let on_disk = self
+            .out
+            .get_ref()
+            .metadata()
+            .map_err(|e| format!("не проверить длину файла: {e}"))?
+            .len();
+        if on_disk != expected {
+            return Err(format!(
+                "должно быть {expected} Б, а на диске {on_disk} Б — битстрим неполон"
+            ));
+        }
         Ok((self.frames, self.payload, format!("{:016x}", self.hash)))
     }
 }
