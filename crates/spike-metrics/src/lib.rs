@@ -351,8 +351,15 @@ impl Recorder {
             // the stages accounted for. Saturating because the two clocks are
             // read at different points and rounding can put them a microsecond
             // the wrong way round; that is noise, not negative work.
+            // The rejected copy path is not overhead, it is a second copy the
+            // operator asked for. Left in, it landed in «вне замеров стадий» —
+            // a row whose whole purpose is to say how much work the stage
+            // timers failed to see — and there charged the shipping pipeline
+            // for a path deliberately run alongside it. `budget` is untouched
+            // on purpose: the product pays for one copy, not two.
             let measured = stat.iter_us.saturating_sub(stat.wait_us);
-            self.outside.push(measured.saturating_sub(staged));
+            let accounted = staged + stat.compare_us.unwrap_or(0);
+            self.outside.push(measured.saturating_sub(accounted));
         }
         self.changed_px_total += stat.changed_px as u128;
         self.copied_px_total += stat.copied_px as u128;
@@ -491,8 +498,18 @@ pub struct Report {
 }
 
 impl Report {
-    /// Frames per second that actually carried new content.
-    pub fn effective_fps(&self) -> f64 {
+    /// Frames per second the machine managed on the wall clock.
+    ///
+    /// Deliberately NOT on the notional timeline the bitrate and the processor
+    /// share use. This one answers "how fast did this machine go", which is a
+    /// question about the wall clock by definition — dividing by a notional
+    /// length would make an unpaced run report exactly its target rate and say
+    /// nothing at all.
+    ///
+    /// Named `wall_fps` rather than `effective_fps` for that reason: the old
+    /// name invited reading it as "the rate a session would see", which is what
+    /// it is only when the run kept pace.
+    pub fn wall_fps(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
         if secs <= 0.0 {
             return 0.0;
@@ -594,15 +611,30 @@ impl Report {
     /// to print a bitrate at all, because several encoders per frame depress the
     /// rate the other way. One sign of the error was guarded, the other was not.
     pub fn mbps(&self) -> f64 {
-        let secs = if self.unpaced {
-            self.frames_seen as f64 / self.target_fps.max(1) as f64
-        } else {
-            self.elapsed.as_secs_f64()
-        };
+        let secs = self.timeline_secs();
         if secs <= 0.0 {
             return 0.0;
         }
         (self.encoded_bytes_total as f64 * 8.0) / secs / 1_000_000.0
+    }
+
+    /// How long this run represents, in seconds.
+    ///
+    /// The wall clock when the run kept pace, and the notional length of the
+    /// frames otherwise. A fixed-frame run deliberately goes flat out, so its
+    /// wall clock is "how fast is this machine", not "how long was the session"
+    /// — billing a bitrate or a processor share to it answers a question nobody
+    /// asked.
+    ///
+    /// One function rather than the same conditional in three places. `mbps` was
+    /// taught this and the processor share was not, so the two sat on the same
+    /// page describing different amounts of time.
+    pub fn timeline_secs(&self) -> f64 {
+        if self.unpaced {
+            self.frames_seen as f64 / self.target_fps.max(1) as f64
+        } else {
+            self.elapsed.as_secs_f64()
+        }
     }
 
     /// Cheapest and dearest configuration by median encode time.
@@ -654,7 +686,52 @@ impl Report {
         if self.budget.len() < MIN_FRAMES_FOR_VERDICT {
             return None;
         }
+        // A verdict is a claim about the whole pipeline, and the budget is a sum
+        // over whichever stages happened to run. With `--encode none` the sum
+        // omits the single most expensive one and still earned a tick — the
+        // machine was declared to keep up with work it had not been asked to do.
+        if !self.missing_stages().is_empty() {
+            return None;
+        }
         self.budget_share(0.95).map(Verdict::classify)
+    }
+
+    /// Stages of the shipping pipeline that produced no samples in this run.
+    ///
+    /// Named rather than counted, because the report has to be able to say
+    /// which one is absent: "no verdict" and "no verdict because nothing was
+    /// encoded" are different messages to the person reading it.
+    pub fn missing_stages(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.readback.is_empty() {
+            out.push("копирование в память");
+        }
+        if self.convert.is_empty() {
+            out.push("конвертация в YUV");
+        }
+        if self.encode.is_empty() {
+            out.push("кодирование");
+        }
+        out
+    }
+
+    /// What `ИТОГО` is the sum of, in this run.
+    ///
+    /// Printed next to it because the row is a sum over stages that ran, and a
+    /// reader comparing two reports has no way to see that one of them is a sum
+    /// over fewer terms than the other.
+    pub fn budget_summands(&self) -> Vec<&'static str> {
+        let mut out = vec!["работа захвата"];
+        if !self.readback.is_empty() {
+            out.push("копирование");
+        }
+        if !self.convert.is_empty() {
+            out.push("конвертация");
+        }
+        if !self.encode.is_empty() {
+            out.push("кодирование");
+        }
+        out
     }
 }
 
@@ -910,9 +987,9 @@ impl std::fmt::Display for Report {
         writeln!(s, "  опрошено                {}", self.frames_seen)?;
         writeln!(
             s,
-            "  с новым содержимым      {} ({:.1} к/с фактически)",
+            "  с новым содержимым      {} ({:.1} к/с по стенным часам)",
             self.frames_new,
-            self.effective_fps()
+            self.wall_fps()
         )?;
         writeln!(
             s,
@@ -982,6 +1059,7 @@ impl std::fmt::Display for Report {
         }
         if !self.budget.is_empty() {
             writeln!(s, "  ИТОГО на кадр        {}", self.budget.summary_ms())?;
+            writeln!(s, "    сумма: {}", self.budget_summands().join(" + "))?;
         }
         if !self.outside.is_empty() {
             // What the four stage timers did not see, measured from outside the
@@ -1033,6 +1111,19 @@ impl std::fmt::Display for Report {
                 }
                 None => writeln!(s, "  {} {}", v.mark(), v.explain())?,
             }
+        } else if !self.budget.is_empty() && !self.missing_stages().is_empty() {
+            writeln!(s, "\n-- Бюджет кадра --")?;
+            writeln!(
+                s,
+                "  Вердикта не будет: в прогоне не участвовали стадии — {}.",
+                self.missing_stages().join(", ")
+            )?;
+            writeln!(
+                s,
+                "  ИТОГО здесь — сумма только оставшихся, и сравнивать её с полным\n  \
+                 прогоном нельзя: вердикт по ней означал бы, что машина успевает\n  \
+                 делать работу, которой её не просили делать."
+            )?;
         } else if !self.budget.is_empty() {
             writeln!(s, "\n-- Бюджет кадра --")?;
             writeln!(
@@ -1055,16 +1146,35 @@ impl std::fmt::Display for Report {
             writeln!(s, "                            p50    p95    p99    max")?;
             writeln!(s, "  весь кадр            {}", self.compare.summary_ms())?;
             writeln!(s, "  изменившиеся области {}", self.readback.summary_ms())?;
-            if let Some(x) = self.copy_speedup() {
+            // The two rows are only comparable if they are the same frames. A
+            // source that reports no dirty metadata copies the whole frame into
+            // the «изменившиеся области» row, and then the table prints a
+            // speedup between the full path and the full path under a line
+            // claiming both ran on one frame. The counts are the only thing
+            // that can tell, so they are checked rather than assumed.
+            if self.compare.len() != self.readback.len() {
+                let orphans = self.readback.len().abs_diff(self.compare.len());
                 writeln!(
                     s,
-                    "\n  на медиане частичное копирование быстрее в {x:.1} раза"
+                    "\n  ⚠ ускорение не считается: строки сняты по разному числу кадров\n    \
+                     ({} против {}, расхождение {orphans}). Обычно это кадры, по которым\n    \
+                     источник не отдал списка изменившихся областей, и в верхнюю строку\n    \
+                     попало полное копирование под видом частичного.",
+                    self.compare.len(),
+                    self.readback.len()
+                )?;
+            } else {
+                if let Some(x) = self.copy_speedup() {
+                    writeln!(
+                        s,
+                        "\n  на медиане частичное копирование быстрее в {x:.1} раза"
+                    )?;
+                }
+                writeln!(
+                    s,
+                    "  оба пути отработали ОДИН И ТОТ ЖЕ кадр, порядок чередуется"
                 )?;
             }
-            writeln!(
-                s,
-                "  оба пути отработали ОДИН И ТОТ ЖЕ кадр, порядок чередуется"
-            )?;
             if let Some((fixed, variable)) = self.copy_cost_split() {
                 writeln!(s, "\n  из стоимости полного копирования:")?;
                 writeln!(
@@ -1282,7 +1392,7 @@ impl std::fmt::Display for Report {
         }
 
         writeln!(s, "\n-- Процессор --")?;
-        write!(s, "{}", self.cpu.render(self.elapsed))?;
+        write!(s, "{}", self.cpu.render(Duration::from_secs_f64(self.timeline_secs())))?;
 
         f.write_str(&s)
     }
@@ -1637,7 +1747,18 @@ mod tests {
         for (cost_us, expected) in cases {
             let mut r = Recorder::new("тест", 1920, 1080, 30);
             for _ in 0..MIN_FRAMES_FOR_VERDICT {
-                r.record(&FrameStat { is_new: true, work_us: cost_us, ..Default::default() });
+                // Every stage contributes, because a verdict is now a claim
+                // about the whole pipeline and is withheld when one is absent.
+                // The split keeps the total at `cost_us` so this test still
+                // measures the thresholds and nothing else.
+                r.record(&FrameStat {
+                    is_new: true,
+                    work_us: cost_us - 3,
+                    readback_us: 1,
+                    convert_us: 1,
+                    encode_us: Some(1),
+                    ..Default::default()
+                });
             }
             let rep = r.finish(Duration::from_secs(1));
             let v = rep.verdict().expect("вердикт");
@@ -1657,7 +1778,14 @@ mod tests {
         // unlucky frame, not a machine.
         let mut r = Recorder::new("тест", 1920, 1080, 30);
         for _ in 0..(MIN_FRAMES_FOR_VERDICT - 1) {
-            r.record(&FrameStat { is_new: true, work_us: 1_000, ..Default::default() });
+            r.record(&FrameStat {
+                is_new: true,
+                work_us: 1_000,
+                readback_us: 1,
+                convert_us: 1,
+                encode_us: Some(1),
+                ..Default::default()
+            });
         }
         let rep = r.finish(Duration::from_secs(30));
         assert!(rep.verdict().is_none());
@@ -1665,6 +1793,107 @@ mod tests {
         let text = rep.to_string();
         assert!(text.contains("Вердикта не будет"), "{text}");
         assert!(text.contains("С ДВИЖЕНИЕМ"), "{text}");
+    }
+
+    /// A run with `--encode none` used to collect a budget of capture plus copy
+    /// plus conversion, compare it against the frame interval, and award a tick.
+    /// The machine was declared to keep up with work nobody asked it to do.
+    #[test]
+    fn a_run_that_never_encoded_earns_no_verdict() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for _ in 0..(MIN_FRAMES_FOR_VERDICT * 2) {
+            r.record(&FrameStat {
+                is_new: true,
+                work_us: 1_000,
+                readback_us: 500,
+                convert_us: 500,
+                // No encoder in this run.
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(30));
+
+        assert!(rep.budget.len() >= MIN_FRAMES_FOR_VERDICT, "кадров достаточно");
+        assert!(rep.verdict().is_none(), "но вердикта быть не должно");
+        assert_eq!(rep.missing_stages(), vec!["кодирование"]);
+
+        let text = rep.to_string();
+        assert!(text.contains("не участвовали стадии"), "{text}");
+        assert!(text.contains("кодирование"), "{text}");
+        // And ИТОГО has to say what it is a sum of, so two reports summing
+        // different stages cannot be read as the same figure.
+        assert!(text.contains("сумма: работа захвата + копирование + конвертация"), "{text}");
+        assert!(!text.contains("сумма: работа захвата + копирование + конвертация + кодирование"));
+    }
+
+    /// The rejected copy path is work the operator asked for, not overhead the
+    /// stage timers missed. Charged to «вне замеров стадий» it made the shipping
+    /// pipeline look like it had unexplained cost in it.
+    #[test]
+    fn the_rejected_copy_path_is_not_charged_to_unmeasured_overhead() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for _ in 0..40 {
+            r.record(&FrameStat {
+                is_new: true,
+                work_us: 1_000,
+                readback_us: 1_000,
+                convert_us: 1_000,
+                encode_us: Some(1_000),
+                // The second copy, run deliberately alongside.
+                compare_us: Some(5_000),
+                // Everything above, plus the second copy, plus 100 µs of real
+                // unmeasured overhead.
+                iter_us: 9_100,
+                wait_us: 0,
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(2));
+        assert_eq!(
+            rep.outside.percentile(0.50),
+            Some(100),
+            "вне стадий должно остаться только настоящее"
+        );
+    }
+
+    /// Two rows over different frames are not a comparison, whatever the ratio
+    /// between them says.
+    #[test]
+    fn a_copy_table_over_unequal_frame_counts_refuses_to_state_a_speedup() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for i in 0..40 {
+            r.record(&FrameStat {
+                is_new: true,
+                work_us: 1_000,
+                readback_us: 2_000,
+                // Only some frames carried the second path.
+                compare_us: if i % 2 == 0 { Some(4_000) } else { None },
+                ..Default::default()
+            });
+        }
+        let rep = r.finish(Duration::from_secs(2));
+        let text = rep.to_string();
+        assert!(text.contains("ускорение не считается"), "{text}");
+        assert!(!text.contains("быстрее в"), "{text}");
+    }
+
+    /// The bitrate was taught the notional timeline and the processor share was
+    /// not, so one page carried two different amounts of elapsed time.
+    #[test]
+    fn the_bitrate_and_the_processor_share_bill_to_the_same_timeline() {
+        let mut r = Recorder::new("тест", 1920, 1080, 30);
+        for _ in 0..60 {
+            r.record(&FrameStat { is_new: true, work_us: 1_000, ..Default::default() });
+        }
+        let mut rep = r.finish(Duration::from_secs(1));
+        rep.unpaced = true;
+
+        // Sixty frames at a target of thirty is two seconds of session,
+        // whatever the one second of wall clock it took to produce them.
+        assert!((rep.timeline_secs() - 2.0).abs() < 1e-9, "{}", rep.timeline_secs());
+        // wall_fps deliberately stays on the wall clock: it answers how fast
+        // the machine went, which is not a question about the session.
+        assert!((rep.wall_fps() - 60.0).abs() < 1e-9, "{}", rep.wall_fps());
     }
 
     #[test]
@@ -1812,7 +2041,7 @@ mod tests {
     fn zero_duration_does_not_divide_by_zero() {
         let r = Recorder::new("тест", 1920, 1080, 30);
         let rep = r.finish(Duration::ZERO);
-        assert_eq!(rep.effective_fps(), 0.0);
+        assert_eq!(rep.wall_fps(), 0.0);
         assert_eq!(rep.mbps(), 0.0);
         // Rendering must work on an empty run: the operator needs to see *that*
         // nothing was captured, not an empty terminal.
