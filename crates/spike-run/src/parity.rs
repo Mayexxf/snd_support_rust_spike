@@ -69,6 +69,13 @@ impl Target {
         matches!(self, Target::LibvpxVp9 | Target::LibvpxVp8)
     }
 
+    /// Whether `-qmin`/`-qmax` do anything useful here. See the measurement in
+    /// [`plan`]: on QSV one encoder corrupts its output and the other ignores
+    /// them.
+    fn takes_quantizer_bounds(self) -> bool {
+        !matches!(self, Target::H264Qsv | Target::HevcQsv)
+    }
+
     pub fn all() -> [Target; 5] {
         [Target::Libx264, Target::H264Qsv, Target::HevcQsv, Target::LibvpxVp9, Target::LibvpxVp8]
     }
@@ -135,15 +142,44 @@ pub fn plan(settings: &Settings, target: Target) -> Plan {
     argv.push(s("-threads"));
     argv.push(s(settings.threads));
 
-    let (qmin, qmax) = if target.vpx_scale() {
-        (settings.min_quantizer, settings.max_quantizer)
+    // The quantizer ceiling goes to everyone who can actually take it, and that
+    // is not everyone. Measured on this machine, 60 frames at 960×540, target
+    // 1000 kbit/s, with and without `-qmin 3 -qmax 45`:
+    //
+    //   libx264     967 kbit/s, 60 frames, 1 keyframe  — honoured
+    //   h264_qsv   1234 kbit/s, 91 frames, 3 keyframes — honoured and CORRUPTED
+    //   hevc_qsv   1074 kbit/s both ways, byte for byte — silently IGNORED
+    //
+    // Three behaviours for one pair of flags. Sending them to QSV therefore buys
+    // nothing in one case and a broken bitstream in the other, so they are
+    // withheld there and the difference is disclosed — which is the honest
+    // outcome, since our encoder does have a ceiling and those two do not.
+    //
+    // This is exactly why the gate reads the bitstream. Passing a flag is not
+    // evidence that it took effect, and here one encoder proved it by producing
+    // a stream that does not decode.
+    if target.takes_quantizer_bounds() {
+        let (qmin, qmax) = if target.vpx_scale() {
+            (settings.min_quantizer, settings.max_quantizer)
+        } else {
+            (to_h26x(settings.min_quantizer), to_h26x(settings.max_quantizer))
+        };
+        argv.push(s("-qmin"));
+        argv.push(s(qmin));
+        argv.push(s("-qmax"));
+        argv.push(s(qmax));
     } else {
-        (to_h26x(settings.min_quantizer), to_h26x(settings.max_quantizer))
-    };
-    argv.push(s("-qmin"));
-    argv.push(s(qmin));
-    argv.push(s("-qmax"));
-    argv.push(s(qmax));
+        unmatched.push(Unmatched {
+            knob: "min/max_quantizer",
+            why: format!(
+                "у QSV не передаются: h264_qsv с -qmax {} выдаёт нечитаемый поток \
+                 (91 кадр из 60, три ключевых), hevc_qsv молча игнорирует — байт в байт \
+                 то же самое. Значит их рейт-контроль работает без нашего потолка, \
+                 а наш с ним",
+                to_h26x(settings.max_quantizer)
+            ),
+        });
+    }
 
     match target {
         Target::LibvpxVp9 | Target::LibvpxVp8 => {
@@ -316,9 +352,27 @@ mod tests {
         let vpx = plan(&st, Target::LibvpxVp9);
         assert_eq!(arg_after(&vpx.argv, "-qmax").as_deref(), Some("56"));
 
-        let h264 = plan(&st, Target::H264Qsv);
-        assert_eq!(arg_after(&h264.argv, "-qmax").as_deref(), Some("45"));
-        assert_eq!(arg_after(&h264.argv, "-qmin").as_deref(), Some("3"));
+        let x264 = plan(&st, Target::Libx264);
+        assert_eq!(arg_after(&x264.argv, "-qmax").as_deref(), Some("45"));
+        assert_eq!(arg_after(&x264.argv, "-qmin").as_deref(), Some("3"));
+    }
+
+    /// Measured, not assumed: h264_qsv given -qmax produces a bitstream that
+    /// does not decode, and hevc_qsv returns byte-identical output with and
+    /// without it. Sending them buys nothing in one case and a broken file in
+    /// the other, so they are withheld and the asymmetry is disclosed.
+    #[test]
+    fn qsv_is_not_given_a_quantizer_ceiling_and_says_so() {
+        let st = base();
+        for t in [Target::H264Qsv, Target::HevcQsv] {
+            let p = plan(&st, t);
+            assert!(!p.argv.iter().any(|a| a == "-qmax"), "{t:?}");
+            assert!(!p.argv.iter().any(|a| a == "-qmin"), "{t:?}");
+            assert!(
+                p.unmatched.iter().any(|u| u.knob.contains("quantizer")),
+                "{t:?} обязан признаться, что идёт без нашего потолка"
+            );
+        }
     }
 
     /// The screen-content hint is the one knob that cannot be mirrored, and the
@@ -372,23 +426,32 @@ mod tests {
             error_resilient: _,
         } = st.clone();
 
+        // Each setting, and the flag that would carry it if this target takes
+        // one. A setting must be on the command line OR named in the caveat
+        // block; never in neither. Checked per setting rather than per flag,
+        // because a knob withheld on purpose — QSV's quantizer bounds, which
+        // corrupt one encoder and are ignored by the other — is disclosed under
+        // its own name and not under ffmpeg's spelling.
+        let checks: [(&str, &[&str]); 7] = [
+            ("bitrate_kbps", &["-b:v"]),
+            ("kf_max_dist", &["-g"]),
+            ("rc_buf_ms", &["-bufsize"]),
+            ("threads", &["-threads"]),
+            ("min/max_quantizer", &["-qmax"]),
+            ("static_threshold", &[]),
+            ("error_resilient", &[]),
+        ];
+
         for t in Target::all() {
             let p = plan(&st, t);
-            let text = format!("{} {}", p.argv.join(" "), p.render());
-            for knob in [
-                "bitrate", "-g", "-bufsize", "-qmin", "-qmax", "-threads",
-            ] {
-                let named = knob == "bitrate" && text.contains("-b:v");
-                assert!(named || text.contains(knob), "{t:?}: {knob} нигде не назван");
+            for (knob, flags) in checks {
+                let on_command_line = flags.iter().any(|f| p.argv.iter().any(|a| a == f));
+                let disclosed = p.unmatched.iter().any(|u| u.knob.contains(knob));
+                assert!(
+                    on_command_line || disclosed,
+                    "{t:?}: «{knob}» ни в ключах, ни в оговорках"
+                );
             }
-            assert!(
-                p.unmatched.iter().any(|u| u.knob == "static_threshold"),
-                "{t:?}: порог покоя не оговорён"
-            );
-            assert!(
-                p.unmatched.iter().any(|u| u.knob == "error_resilient"),
-                "{t:?}: устойчивость к потерям не оговорена"
-            );
         }
     }
 
