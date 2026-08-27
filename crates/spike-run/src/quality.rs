@@ -203,12 +203,151 @@ pub struct Report {
     pub mae: f64,
     /// The rate both files declared, carried so nothing downstream has to guess.
     pub fps: f64,
+    /// Whether the pair was long enough for the alignment probe to run.
+    ///
+    /// A short file is not checked, and a number nobody checked should not read
+    /// like one that was.
+    pub aligned: bool,
+    /// No pixel moved further than the finest threshold, in any frame.
+    ///
+    /// Not a codec result. A stream that damaged nothing at all is a copy of its
+    /// own source — the same file passed twice, or a decode written over the
+    /// input. Reported rather than refused here so the measurement stays a
+    /// measurement; the caller that publishes numbers is the one that must
+    /// refuse it.
+    pub untouched: bool,
     /// The middle threshold's share, one entry per frame, **in frame order**.
     ///
     /// Percentiles answer "how bad overall" and cannot answer "how long until
     /// it comes back", which is the question the `settle` scenario exists to
     /// ask. A curve is needed for that, and a sorted one is not a curve.
     pub series: Vec<f64>,
+}
+
+/// How many source frames the alignment probe scores.
+///
+/// Twelve is enough for the answer to be unambiguous on real content and small
+/// enough that buffering them costs about fifty megabytes at 1080p.
+const ALIGN_PROBE: usize = 12;
+
+/// How far either way the probe looks for a better fit.
+///
+/// Two frames. A comparison off by more than that is off by a keyframe interval
+/// or a whole scenario, and the damage figure will be obviously wrong rather
+/// than quietly flattering.
+const ALIGN_RANGE: i32 = 2;
+
+/// What one pair of frames contributed.
+struct FrameScore {
+    edges: u64,
+    damaged: [u64; DAMAGE.len()],
+    damaged_all: u64,
+    error_sum: u64,
+}
+
+/// Score one source frame against one test frame.
+///
+/// Pulled out of the main loop because the alignment probe has to run exactly
+/// the same arithmetic at four other offsets. Two implementations of "how
+/// damaged is this frame" would let the probe bless an offset the measurement
+/// then disagrees with.
+fn score_frame(src: &[u8], dst: &[u8], w: usize, h: usize) -> FrameScore {
+    let mut s = FrameScore { edges: 0, damaged: [0; DAMAGE.len()], damaged_all: 0, error_sum: 0 };
+    for row in 0..h - 1 {
+        let base = row * w;
+        for col in 0..w - 1 {
+            let i = base + col;
+            let here = i32::from(src[i]);
+            let gx = (i32::from(src[i + 1]) - here).unsigned_abs();
+            let gy = (i32::from(src[i + w]) - here).unsigned_abs();
+            let err = (i32::from(dst[i]) - here).unsigned_abs();
+            s.error_sum += u64::from(err);
+
+            if err > u32::from(DAMAGE[1]) {
+                s.damaged_all += 1;
+            }
+            if gx + gy >= u32::from(EDGE_MIN) {
+                s.edges += 1;
+                for (k, &t) in DAMAGE.iter().enumerate() {
+                    if err > u32::from(t) {
+                        s.damaged[k] += 1;
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+/// Which shift makes the two sequences agree best, and by how much.
+///
+/// The one defect in this harness whose symptom is a score BETTER than the
+/// truth. A comparison pair off by a frame or two — a stale decode, an export
+/// and an encode covering different stretches, a container that dropped one —
+/// does not produce an absurd number. It produced 22.94% damage and «текст
+/// собрался через 0 кадр(ов)», which is better than every real row in the
+/// settle report. It would have won the ladder.
+///
+/// So the answer is not "is this plausible" but "does any other shift fit
+/// better". If one does, the pair is not what it claims to be, whatever the
+/// numbers look like.
+///
+/// Returns `(best_offset, scores)` where index `k` of `scores` is offset
+/// `k as i32 - ALIGN_RANGE`.
+fn alignment(src: &[Vec<u8>], test: &[Vec<u8>], w: usize, h: usize) -> (i32, Vec<f64>) {
+    let span = (ALIGN_RANGE * 2 + 1) as usize;
+    let mut scores = vec![f64::INFINITY; span];
+
+    for (k, score) in scores.iter_mut().enumerate() {
+        let d = k as i32 - ALIGN_RANGE;
+        let mut edges = 0u64;
+        let mut damaged = 0u64;
+        let mut used = 0usize;
+
+        for i in 0..ALIGN_PROBE {
+            let si = i + ALIGN_RANGE as usize;
+            let ti = si as i32 + d;
+            if si >= src.len() || ti < 0 || ti as usize >= test.len() {
+                continue;
+            }
+            let s = score_frame(&src[si], &test[ti as usize], w, h);
+            edges += s.edges;
+            damaged += s.damaged[SETTLE_THRESHOLD];
+            used += 1;
+        }
+        if used > 0 && edges > 0 {
+            *score = damaged as f64 / edges as f64;
+        }
+    }
+
+    // Zero is the null hypothesis and it only loses to clear evidence.
+    //
+    // The first version simply took the minimum, and a tie made it accuse: on
+    // content where every offset scored exactly 50% it named −2 and refused a
+    // perfectly good pair. A probe that cannot tell the offsets apart has found
+    // nothing, and "found nothing" must read as aligned. So an alternative has
+    // to be better by a fifth AND by two whole points before it counts —
+    // comfortably below what a real off-by-one does (44% against 65% on
+    // scrolled text, 4% against 60% on a settled screen) and comfortably above
+    // noise.
+    let zero = scores[ALIGN_RANGE as usize];
+    if !zero.is_finite() {
+        return (0, scores);
+    }
+    let mut best = 0;
+    let mut best_score = zero;
+    for (k, &v) in scores.iter().enumerate() {
+        let d = k as i32 - ALIGN_RANGE;
+        if d == 0 || !v.is_finite() {
+            continue;
+        }
+        if v < best_score && v < zero * 0.8 && v + 0.02 < zero {
+            best = d;
+            best_score = v;
+        }
+    }
+
+    (best, scores)
 }
 
 /// Compare two Y4M sequences frame by frame.
@@ -241,6 +380,89 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
     let mut pixel_total = 0u64;
     let mut error_total = 0u64;
     let mut frames = 0u64;
+    let mut untouched = true;
+
+    // The head of both files, held in memory so the alignment probe can look at
+    // the same frames from several offsets. Everything after this streams.
+    let head = ALIGN_PROBE + 2 * ALIGN_RANGE as usize;
+    let mut head_src: Vec<Vec<u8>> = Vec::with_capacity(head);
+    let mut head_test: Vec<Vec<u8>> = Vec::with_capacity(head);
+    while head_src.len() < head {
+        let Some(luma) = a.next_luma()? else { break };
+        let s = luma.to_vec();
+        let Some(luma) = b.next_luma()? else {
+            return Err(format!(
+                "во втором файле кадров меньше: кончились на {}",
+                head_src.len()
+            ));
+        };
+        head_test.push(luma.to_vec());
+        head_src.push(s);
+    }
+
+    if head_src.is_empty() {
+        return Err("в исходнике нет ни одного кадра".to_owned());
+    }
+
+    // Only worth asking when there is enough material for the answer to mean
+    // something. A three-frame file cannot tell a shift from a bad codec.
+    let mut align_note = None;
+    if head_src.len() >= ALIGN_PROBE + ALIGN_RANGE as usize {
+        let (best, scores) = alignment(&head_src, &head_test, w, h);
+        if best != 0 {
+            let table: Vec<String> = scores
+                .iter()
+                .enumerate()
+                .map(|(k, v)| {
+                    let d = k as i32 - ALIGN_RANGE;
+                    if v.is_finite() {
+                        format!("{d:+}: {:.1}%", v * 100.0)
+                    } else {
+                        format!("{d:+}: —")
+                    }
+                })
+                .collect();
+            return Err(format!(
+                "кадры не совпадают: при сдвиге {best:+} картинка сходится ЛУЧШЕ,\n\
+                 чем при нулевом. Значит это не тот декодированный поток, не тот\n\
+                 исходник, или один из них потерял кадр.\n\
+                 Порча по первым {ALIGN_PROBE} кадрам: {}\n\
+                 Считать по такой паре нельзя: смещённое сравнение даёт не абсурд,\n\
+                 а правдоподобное число, и оно оказывается ЛУЧШЕ настоящих.",
+                table.join(", ")
+            ));
+        }
+        let _ = scores;
+        align_note = Some(best);
+    }
+
+    let counted = ((h - 1) * (w - 1)) as u64;
+    let mut take = |s: FrameScore,
+                    edge_series: &mut Vec<Vec<f64>>,
+                    all_series: &mut Vec<f64>| {
+        pixel_total += counted;
+        edge_total += s.edges;
+        error_total += s.error_sum;
+        if s.damaged[0] > 0 {
+            untouched = false;
+        }
+        for k in 0..DAMAGE.len() {
+            // A frame with no edges at all — a blank screen — contributes
+            // nothing rather than a zero, which would be read as "undamaged".
+            if s.edges > 0 {
+                edge_series[k].push(s.damaged[k] as f64 / s.edges as f64);
+            }
+        }
+        all_series.push(s.damaged_all as f64 / counted as f64);
+        frames += 1;
+    };
+
+    for i in 0..head_src.len() {
+        let s = score_frame(&head_src[i], &head_test[i], w, h);
+        take(s, &mut edge_series, &mut all_series);
+    }
+    drop(head_src);
+    drop(head_test);
 
     loop {
         // Both sides are pulled before either is used: `next_luma` borrows its
@@ -251,55 +473,14 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
         let Some(dst_frame) = b.next_luma()? else {
             return Err(format!("во втором файле кадров меньше: кончились на {frames}"));
         };
-
-        let mut edges = 0u64;
-        let mut damaged = [0u64; DAMAGE.len()];
-        let mut damaged_all = 0u64;
-
-        for row in 0..h - 1 {
-            let base = row * w;
-            for col in 0..w - 1 {
-                let i = base + col;
-                let here = i32::from(src_frame[i]);
-                let gx = (i32::from(src_frame[i + 1]) - here).unsigned_abs();
-                let gy = (i32::from(src_frame[i + w]) - here).unsigned_abs();
-                let err = (i32::from(dst_frame[i]) - here).unsigned_abs();
-                error_total += u64::from(err);
-
-                if err > u32::from(DAMAGE[1]) {
-                    damaged_all += 1;
-                }
-                if gx + gy >= u32::from(EDGE_MIN) {
-                    edges += 1;
-                    for (k, &t) in DAMAGE.iter().enumerate() {
-                        if err > u32::from(t) {
-                            damaged[k] += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let counted = ((h - 1) * (w - 1)) as u64;
-        pixel_total += counted;
-        edge_total += edges;
-        for k in 0..DAMAGE.len() {
-            // A frame with no edges at all — a blank screen — contributes
-            // nothing rather than a zero, which would be read as "undamaged".
-            if edges > 0 {
-                edge_series[k].push(damaged[k] as f64 / edges as f64);
-            }
-        }
-        all_series.push(damaged_all as f64 / counted as f64);
-        frames += 1;
+        let s = score_frame(&src_frame, dst_frame, w, h);
+        take(s, &mut edge_series, &mut all_series);
     }
 
-    if frames == 0 {
-        return Err("в исходнике нет ни одного кадра".to_owned());
-    }
     if b.next_luma()?.is_some() {
         return Err("во втором файле кадров больше, чем в исходнике".to_owned());
     }
+    let aligned = align_note.is_some();
 
     // Taken before the percentiles, which sort in place: the curve is only a
     // curve while it is still in frame order.
@@ -322,6 +503,8 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
         all_p95: percentile(&mut all_series, 0.95),
         mae: error_total as f64 / pixel_total as f64,
         fps,
+        aligned,
+        untouched,
         series,
     })
 }
@@ -385,9 +568,14 @@ impl Report {
             self.frames, self.width, self.height
         ));
         out.push_str(&format!(
-            "  краевых пикселей в исходнике {:.1}% — только по ним и считается\n\n",
+            "  краевых пикселей в исходнике {:.1}% — только по ним и считается\n",
             self.edge_share * 100.0
         ));
+        out.push_str(if self.aligned {
+            "  выравнивание проверено: сдвиг на кадр в обе стороны сходится хуже\n\n"
+        } else {
+            "  ⚠ выравнивание НЕ проверено: кадров слишком мало для пробы\n\n"
+        });
         out.push_str("  порог   испорчено краевых, %\n");
         out.push_str("  luma      p50     p95\n");
         for (k, &t) in DAMAGE.iter().enumerate() {
@@ -626,6 +814,8 @@ mod tests {
             all_p95: 0.0,
             mae: 0.0,
             fps,
+            aligned: true,
+            untouched: false,
             series: series.clone(),
         }
         .render_settle(10, 4);
@@ -678,6 +868,120 @@ mod tests {
 
         let r = compare(&a, &b).unwrap();
         assert!((r.fps - 29.97).abs() < 0.01, "{}", r.fps);
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// Write a Y4M of several frames, luma supplied per frame.
+    fn write_many(path: &Path, w: usize, h: usize, frames: &[Vec<u8>]) {
+        let mut f = File::create(path).unwrap();
+        write!(f, "YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\n").unwrap();
+        for luma in frames {
+            f.write_all(b"FRAME\n").unwrap();
+            f.write_all(luma).unwrap();
+            f.write_all(&vec![128u8; 2 * (w / 2) * (h / 2)]).unwrap();
+        }
+    }
+
+    /// A whole field of stripes that translates every frame — scrolled text, in
+    /// miniature.
+    ///
+    /// Deliberately not a single moving line. That was the first version, and
+    /// with it every offset scored exactly the same: one stripe damaged is one
+    /// stripe damaged wherever it sits, so the probe had nothing to compare and
+    /// the test was measuring a tie rather than a shift.
+    fn moving(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|k| {
+                let mut v = vec![235u8; w * h];
+                for row in 0..h {
+                    for col in 0..w {
+                        if (col + k * 7) % 5 == 0 {
+                            v[row * w + col] = 16;
+                        }
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// The defect whose symptom is a score BETTER than the truth. A pair off by
+    /// one frame does not look absurd; it looks like a good codec.
+    #[test]
+    fn a_pair_off_by_one_frame_is_refused_rather_than_scored() {
+        let d = dir();
+        let (a, b) = (d.join("sh-a.y4m"), d.join("sh-b.y4m"));
+        let (w, h) = (64usize, 16usize);
+        let seq = moving(w, h, 20);
+
+        write_many(&a, w, h, &seq);
+        // Same frames, shifted by one: frame i of the test is frame i+1 of the
+        // source. Every picture is genuine; only the pairing is wrong.
+        write_many(&b, w, h, &seq[1..].to_vec());
+
+        let err = compare(&a, &b).unwrap_err();
+        assert!(
+            err.contains("не совпадают") || err.contains("кадров меньше"),
+            "{err}"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// Same length, so nothing but the alignment probe can notice.
+    #[test]
+    fn a_shift_that_keeps_the_frame_count_is_still_caught() {
+        let d = dir();
+        let (a, b) = (d.join("sh2-a.y4m"), d.join("sh2-b.y4m"));
+        let (w, h) = (64usize, 16usize);
+        let seq = moving(w, h, 24);
+
+        write_many(&a, w, h, &seq[0..20].to_vec());
+        write_many(&b, w, h, &seq[1..21].to_vec());
+
+        let err = compare(&a, &b).unwrap_err();
+        assert!(err.contains("не совпадают"), "{err}");
+        assert!(err.contains("сдвиге"), "должен назвать сдвиг: {err}");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// The guard must not fire on an honest comparison of a lossy stream.
+    #[test]
+    fn a_genuinely_damaged_but_aligned_pair_passes() {
+        let d = dir();
+        let (a, b) = (d.join("ok-a.y4m"), d.join("ok-b.y4m"));
+        let (w, h) = (64usize, 16usize);
+        let seq = moving(w, h, 20);
+        // Blur every stripe: real damage, right pairing.
+        let hurt: Vec<Vec<u8>> = seq
+            .iter()
+            .map(|f| f.iter().map(|&p| if p == 16 { 120 } else { p }).collect())
+            .collect();
+
+        write_many(&a, w, h, &seq);
+        write_many(&b, w, h, &hurt);
+
+        let r = compare(&a, &b).expect("выровненная пара обязана считаться");
+        assert!(r.aligned, "проба должна была отработать");
+        assert!(!r.untouched, "порча есть");
+        assert!(r.edge_p50[SETTLE_THRESHOLD] > 0.0);
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn an_untouched_pair_is_flagged_so_the_caller_can_refuse_it() {
+        let d = dir();
+        let (a, b) = (d.join("cp-a.y4m"), d.join("cp-b.y4m"));
+        let (w, h) = (64usize, 16usize);
+        let seq = moving(w, h, 20);
+        write_many(&a, w, h, &seq);
+        write_many(&b, w, h, &seq);
+
+        let r = compare(&a, &b).unwrap();
+        assert!(r.untouched, "копия обязана быть помечена");
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
     }

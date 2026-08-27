@@ -1464,6 +1464,22 @@ fn main() {
             );
         }
         match quality::compare(&src, &test) {
+            // Zero damage everywhere is not a codec doing well, it is the same
+            // pixels on both sides — the file passed twice, or a decode written
+            // over its own input. Refused here rather than inside `compare`, so
+            // the measurement stays usable by anything that legitimately wants
+            // to score a copy; the mode that publishes numbers must not.
+            Ok(report) if report.untouched => {
+                eprintln!(
+                    "\nОшибка: ни один пиксель не сдвинулся ни в одном из {} кадров.\n\
+                     Это не результат кодека, а копия: скорее всего один и тот же файл\n\
+                     передан дважды, либо декодирование записалось поверх исходника.\n\
+                     Такая пара даёт 0% порчи и «собрался за 0 кадров» — то есть\n\
+                     выглядит лучше любой настоящей строки.",
+                    report.frames
+                );
+                std::process::exit(1);
+            }
             Ok(report) => {
                 print!("{}", report.render());
                 // Only for a sequence that actually stops: reading a settle
