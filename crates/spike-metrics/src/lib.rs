@@ -324,7 +324,16 @@ impl Recorder {
         // A stage that genuinely did not run contributes a zero, which is the
         // truth about that frame.
         self.readback.push(stat.readback_us);
-        self.convert.push(stat.convert_us);
+        // Conversion is the one stage a comparison run does not do once. Each
+        // scale is converted separately and charged to the tracks that read it
+        // (`TrackStat::convert_us`), so the figure arriving here is a zero that
+        // means "not measured", not a zero that means "free" — and pushing it
+        // printed a row of `0.0 0.0 0.0 0.0` under a stage that had in fact
+        // cost 1.6 ms a frame, in every comparison report this harness has
+        // produced. Readback above is not gated: that one really is paid once.
+        if !self.comparing {
+            self.convert.push(stat.convert_us);
+        }
         if let Some(us) = stat.compare_us {
             self.compare.push(us);
         }
@@ -1092,13 +1101,14 @@ impl std::fmt::Display for Report {
             writeln!(s, "\n-- Сравнение на одних и тех же кадрах --")?;
             writeln!(
                 s,
-                "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>4}",
+                "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>9}  {:>4}",
                 "конфигурация",
                 "размер",
                 "конверт.",
                 "кодирование p50/p95",
                 "бюджет p95",
                 "разн.кадр",
+                "ключ.кадр",
                 "q50"
             )?;
             for t in &self.tracks {
@@ -1137,11 +1147,41 @@ impl std::fmt::Display for Report {
                     Some(q) => format!("{q}"),
                     None => "—".to_owned(),
                 };
+                // Count and mean size together, because either alone misleads.
+                // A keyframe here is fifty times a delta frame, so a row with
+                // one more of them carries a megabit per minute the delta
+                // column cannot show — and the delta column is what the reader
+                // has been comparing rows by. Collected since tracks existed
+                // and printed by nothing until now.
+                let key = match t.mean_keyframe_bytes() {
+                    Some(b) => format!("{}×{} КБ", t.keyframes, b / 1024),
+                    None => "—".to_owned(),
+                };
                 writeln!(
                     s,
-                    "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>4}",
-                    t.label, size, conv, enc, bud, bytes, q
+                    "  {:<w$}  {:>9}  {:>8}  {:>19}  {:>11}  {:>9}  {:>9}  {:>4}",
+                    t.label, size, conv, enc, bud, bytes, key, q
                 )?;
+            }
+
+            // Its own line rather than a column, because it is zero in every
+            // run so far and a column of zeros is a column nobody reads. When
+            // it stops being zero it is the most important number on the page:
+            // the frames in it never reached a receiver at all, and every other
+            // figure in the row was computed as though the screen had been
+            // quiet.
+            let dropping: Vec<&Track> = self.tracks.iter().filter(|t| t.encode_drops > 0).collect();
+            if !dropping.is_empty() {
+                writeln!(s, "\n  ⚠ кодер принял кадры и не выдал ничего:")?;
+                for t in dropping {
+                    writeln!(
+                        s,
+                        "    {:<w$}  {} из {}",
+                        t.label,
+                        plural(t.encode_drops, "кадр", "кадра", "кадров"),
+                        t.frames
+                    )?;
+                }
             }
 
             if let Some((cheap, dear)) = self.encode_spread() {
@@ -1777,5 +1817,120 @@ mod tests {
         // Rendering must work on an empty run: the operator needs to see *that*
         // nothing was captured, not an empty terminal.
         let _ = rep.to_string();
+    }
+
+    /// A comparison run converts once per *scale* and charges each track for
+    /// its own, so the shared conversion timer is never written. Printing it
+    /// anyway put `конвертация в YUV 0.0 0.0 0.0 0.0` into every comparison
+    /// report on disk, under a stage the per-track column shows costing 1.6 ms.
+    #[test]
+    fn a_comparison_does_not_print_a_conversion_it_never_timed() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s1", 100, 100);
+        let b = r.add_track("vp9:s2", 50, 50);
+        for _ in 0..40 {
+            compare_frame(&mut r, &[(a, 6_000, 40_000, 8_000), (b, 3_000, 10_000, 5_000)]);
+        }
+        let text = r.finish(Duration::from_secs(1)).to_string();
+        assert!(!text.contains("конвертация в YUV"), "{text}");
+        // The per-track column is where it really is, and it must stay.
+        assert!(text.contains("конверт."), "{text}");
+        // Readback is not gated with it: that one is genuinely paid once per
+        // frame and shared, and dropping it would lose a real measurement.
+        assert!(text.contains("копирование в память"), "{text}");
+    }
+
+    /// The same stage in a single-encoder run is measured and must still print,
+    /// or the fix above would have removed the row rather than the falsehood.
+    #[test]
+    fn a_single_run_still_prints_its_conversion() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        for _ in 0..40 {
+            r.record(&FrameStat {
+                is_new: true,
+                work_us: 100,
+                readback_us: 900,
+                convert_us: 1_600,
+                encode_us: Some(10_000),
+                ..Default::default()
+            });
+        }
+        let text = r.finish(Duration::from_secs(1)).to_string();
+        assert!(text.contains("конвертация в YUV"), "{text}");
+        assert!(text.contains("1.6"), "{text}");
+    }
+
+    /// Feed one frame where each track may emit a keyframe or emit nothing.
+    fn compare_frame_kinds(r: &mut Recorder, tracks: &[(usize, usize, bool, bool)]) {
+        r.record(&FrameStat { wait_us: 1_000, work_us: 100, readback_us: 900, is_new: true, ..Default::default() });
+        for &(index, bytes, keyframe, dropped) in tracks {
+            r.record_track(
+                index,
+                &TrackStat {
+                    shared_us: 1_000,
+                    convert_us: 1_000,
+                    encode_us: 10_000,
+                    bytes,
+                    keyframe,
+                    dropped,
+                    quantizer: Some(56),
+                },
+            );
+        }
+    }
+
+    /// Both figures were collected from the day tracks existed and printed by
+    /// nothing. They are the first thing to check when two rows disagree about
+    /// bitrate: one extra keyframe is fifty delta frames, and a dropped frame
+    /// is a frame the receiver never saw at all.
+    #[test]
+    fn the_comparison_table_names_keyframes_and_dropped_frames() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s1:m56", 100, 100);
+        let b = r.add_track("vp9:s1:m63", 100, 100);
+        // Track `a` opens with a 100 KB keyframe and later drops two frames;
+        // track `b` does neither.
+        compare_frame_kinds(&mut r, &[(a, 102_400, true, false), (b, 51_200, true, false)]);
+        for i in 0..39 {
+            let a_drops = i < 2;
+            compare_frame_kinds(
+                &mut r,
+                &[(a, if a_drops { 0 } else { 8_000 }, false, a_drops), (b, 5_000, false, false)],
+            );
+        }
+        let text = r.finish(Duration::from_secs(1)).to_string();
+
+        assert!(text.contains("ключ.кадр"), "нет заголовка столбца:\n{text}");
+        assert!(text.contains("1×100 КБ"), "нет ключевого кадра дорожки a:\n{text}");
+        assert!(text.contains("1×50 КБ"), "нет ключевого кадра дорожки b:\n{text}");
+        assert!(text.contains("кодер принял кадры и не выдал ничего"), "{text}");
+        assert!(text.contains("2 кадра из 40"), "не названы потери дорожки a:\n{text}");
+        // The track that dropped nothing must not appear in that list at all.
+        // Only the list itself is examined — it ends at the blank line, and the
+        // rest of the report names every track for other reasons.
+        let list = text
+            .split("не выдал ничего:\n")
+            .nth(1)
+            .expect("список есть")
+            .split("\n\n")
+            .next()
+            .expect("список кончается пустой строкой");
+        assert!(list.contains("vp9:s1:m56"), "дорожка с потерями пропала:\n{list}");
+        assert!(!list.contains("vp9:s1:m63"), "дорожка без потерь попала в список:\n{list}");
+    }
+
+    /// No drops is the case in every run so far, and it must stay silent: a
+    /// warning that fires always is a warning nobody reads.
+    #[test]
+    fn a_comparison_without_drops_says_nothing_about_them() {
+        let mut r = Recorder::new("тест", 100, 100, 30);
+        let a = r.add_track("vp9:s1", 100, 100);
+        for _ in 0..40 {
+            compare_frame_kinds(&mut r, &[(a, 8_000, false, false)]);
+        }
+        let text = r.finish(Duration::from_secs(1)).to_string();
+        assert!(!text.contains("не выдал ничего"), "{text}");
+        // And with no keyframe at all the column says so rather than lying.
+        assert!(text.contains("ключ.кадр"), "{text}");
     }
 }
