@@ -134,6 +134,8 @@ struct Args {
     emit: Option<PathBuf>,
     /// Score one decoded sequence against the source it came from, and stop.
     quality: Option<(PathBuf, PathBuf)>,
+    /// Also write the per-frame curve there.
+    quality_csv: Option<PathBuf>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -181,6 +183,7 @@ impl Default for Args {
             export: None,
             emit: None,
             quality: None,
+            quality_csv: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -456,7 +459,11 @@ fn usage() -> &'static str {
                                        кодер сдвинул дальше порога: фон
                                        воспроизводят все, а разборчивость живёт
                                        на штрихах. Кодек тут ни при чём — годится
-                                       всё, что ffmpeg умеет декодировать
+                                       всё, что ffmpeg умеет декодировать.
+                                       При --motion settle добавляет отчёт о
+                                       том, за сколько кадров текст собирается
+                                       после каждой остановки
+    --quality-csv <файл>               заодно выписать покадровую кривую
     --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
                                        показывает, что видит получатель после
                                        потерянного пакета и надолго ли
@@ -469,10 +476,12 @@ fn usage() -> &'static str {
                                        ОДНИХ И ТЕХ ЖЕ кадрах, в одном прогоне.
                                        Конфигурация: кодек[:sМасштаб][:tПотоки]
                                        [:cCpuUsed][:bБитрейт][:kПлитки][:rRowMt]
-                                       [:nПорог][:qМинQ][:uРежим][:lУровеньCQ],
+                                       [:nПорог][:qМинQ][:mМаксQ][:eПотери]
+                                       [:uРежим][:lУровеньCQ],
                                        опущенное берётся из ключей выше. Пример:
                                          --compare vp9:s2:t2,vp9:s2:t4,vp8:s2
                                          --compare vp9:s2:t4,vp9:s2:t4:r1
+                                         --compare vp9:s1:m56,vp9:s1:m63
     -h, --help                         эта справка
 
 Сценарии, которые нужны плану:
@@ -529,6 +538,7 @@ fn parse_args() -> Result<Args, String> {
                 let test = PathBuf::from(value()?);
                 args.quality = Some((src, test));
             }
+            "--quality-csv" => args.quality_csv = Some(PathBuf::from(value()?)),
             "--drop-frame" => {
                 let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
                 args.drop_frame = Some(n);
@@ -711,6 +721,54 @@ fn build_image(args: &Args, path: &Path) -> Result<Box<dyn FrameSource>, String>
 /// Whatever `--source` says is what gets grabbed, so a synthetic frame can be
 /// saved on a machine with no desktop duplication — which is how the replay path
 /// gets tested without Windows.
+/// What produced the file that is about to leave this machine.
+///
+/// The build stamp exists because the harness is copied between machines and
+/// its output is the deliverable — see `build.rs`. It reached the measured run
+/// and stopped there, which was fine while the only output was a report that
+/// carried it. It is not fine now: `--export-yuv` and `--emit-ivf` write files
+/// that are carried to another tool, decoded there, and turned into a row of a
+/// table, and neither format has anywhere to keep this.
+///
+/// The `.ivf` case is the sharp one. Its bytes depend on every key below, and
+/// the headline of `report-n100-quality.txt` — that our tuning beats ffmpeg's
+/// by 37% of the bitrate — is a claim about a file whose quantizer ceiling was
+/// recoverable only from whoever remembered typing `--max-q 63`.
+///
+/// `encoded` is false for a frame export, where nothing but the scale and the
+/// rate reached the file, and listing encoder keys would suggest otherwise.
+fn stamp(args: &Args, encoded: bool) -> String {
+    let mut s = format!("  сборка стенда  {}\n", env!("SPIKE_BUILD"));
+    s.push_str(&format!("  масштаб        {}\n", args.scale));
+    s.push_str(&format!("  темп в файле   {} к/с\n", args.fps));
+    if encoded {
+        s.push_str(&format!(
+            "  кодер          {} при {} кбит/с, cpu-used {}, потоков {}\n",
+            args.codec.name(),
+            args.bitrate_kbps,
+            args.cpu_used,
+            args.threads
+        ));
+        s.push_str(&format!(
+            "  квантователь   от {} до {}\n",
+            args.min_quantizer, args.max_quantizer
+        ));
+        s.push_str(&format!(
+            "  рейт-контроль  {}{}\n",
+            args.rc_mode,
+            if args.rc_mode == "cq" { format!(" на {}", args.cq_level) } else { String::new() }
+        ));
+        s.push_str(&format!(
+            "  прочее         плиток log2 {}, row-mt {}, порог покоя {}, устойчивость к потерям {}\n",
+            args.tile_columns,
+            u8::from(args.row_mt),
+            args.static_threshold,
+            u8::from(args.error_resilient)
+        ));
+    }
+    s
+}
+
 /// Write out the frames the encoder would have been handed, and stop.
 ///
 /// Exists so the codec choice can be settled against encoders this harness does
@@ -792,6 +850,8 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
     let (frames, bytes, fingerprint) = writer.finish()?;
     println!("\nЗаписано: {frames} кадров, {} МБ", bytes / 1_048_576);
     println!("  отпечаток кадров {fingerprint}");
+    println!("\nЧем это снято:");
+    print!("{}", stamp(args, false));
     println!("\nЭто ровно те плоскости, которые получил бы наш кодер при --scale {}.", args.scale);
     println!("Отпечаток печатается для того, чтобы это можно было проверить, а не");
     println!("принимать на слово: два экспорта одних и тех же кадров дают его же.");
@@ -862,7 +922,6 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let mut payload: Vec<u8> = Vec::new();
     let mut done = 0u64;
     let mut keyframes = 0u64;
-    let mut dropped = 0u64;
     let deadline = Instant::now() + Duration::from_secs(600);
 
     while done < want && Instant::now() < deadline {
@@ -890,11 +949,27 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
             keyframes += 1;
         }
         if out.dropped {
-            // No packet, so no IVF frame — and the decoder will hand back fewer
-            // pictures than we counted. Reported for that reason: a frame count
-            // that does not match is otherwise read as a broken writer.
-            dropped += 1;
-            continue;
+            // No packet, so no IVF frame — and the file then holds fewer
+            // pictures than the export it exists to be compared against. Worse
+            // than short: `ivf::Writer` numbers timestamps by frames *written*,
+            // so the hole closes up and every frame after this one is scored
+            // against the wrong source frame. A quality table that is silently
+            // off by one frame is the one outcome this whole pass is meant to
+            // prevent, so it refuses instead of reporting a count and hoping
+            // the reader notices.
+            //
+            // Unreachable today — `rc_dropframe_thresh` is left at libvpx's
+            // zero and nothing is ever dropped. That is the reason it has to be
+            // an error rather than a counter: on the day it becomes reachable,
+            // the damage is a number nobody can tell is wrong.
+            return Err(format!(
+                "кодер принял кадр {} и не выдал ни одного пакета.\n\
+                 Битстрим с дырой нельзя сопоставить с --export-yuv покадрово:\n\
+                 нумерация в IVF идёт по записанным кадрам, дыра схлопнется, и\n\
+                 качество каждого следующего кадра считалось бы против чужого\n\
+                 исходника. Файл не дописан намеренно.",
+                done - 1
+            ));
         }
         writer.frame(&payload)?;
     }
@@ -909,8 +984,10 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
 
     println!("\nЗаписано: {frames} кадров, {bytes} Б сжатых данных");
     println!("  {kbps:.0} кбит/с при {} к/с, {:.0} Б на кадр", args.fps, bytes as f64 / frames as f64);
-    println!("  ключевых кадров {keyframes}, кодер выбросил {dropped}");
+    println!("  ключевых кадров {keyframes}");
     println!("  отпечаток битстрима {fingerprint}");
+    println!("\nЧем это снято:");
+    print!("{}", stamp(args, true));
     println!("\nЭто наш кодер на наших настройках. Чтобы число легло на ту же ось,");
     println!("что и чужие кодеки, декодируйте файл и сравните с --export-yuv тех же");
     println!("кадров: содержимое совпадёт до байта, а разойдётся только качество.");
@@ -1337,7 +1414,22 @@ fn main() {
 
     if let Some((src, test)) = args.quality.clone() {
         match quality::compare(&src, &test) {
-            Ok(report) => print!("{}", report.render()),
+            Ok(report) => {
+                print!("{}", report.render());
+                // Only for a sequence that actually stops: reading a settle
+                // curve off continuous scrolling would report a settling time
+                // for something that never settles.
+                if Scenario::parse(&args.motion) == Some(Scenario::Settle) {
+                    print!("{}", report.render_settle(image::SETTLE_CYCLE, image::SETTLE_SCROLL));
+                }
+                if let Some(path) = &args.quality_csv {
+                    if let Err(e) = report.write_series(path) {
+                        eprintln!("\nОшибка: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("  покадровая кривая записана в {}", path.display());
+                }
+            }
             Err(e) => {
                 eprintln!("\nОшибка: {e}");
                 std::process::exit(1);

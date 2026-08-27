@@ -46,6 +46,22 @@ pub enum Scenario {
     /// A dialog is dragged across the desktop: two medium rectangles per frame,
     /// where it was and where it is.
     Drag,
+    /// Scrolled, then stopped, over and over. The one a support session is
+    /// actually made of, and the only one where "is the screen readable" is a
+    /// question with an answer.
+    ///
+    /// [`Scenario::Scroll`] never stops, and at speed no encoder keeps text
+    /// legible — measured: every codec tried lands between 58% and 70% of
+    /// stroke pixels damaged in its worst frames, whatever the bitrate. So a
+    /// readability bar cannot live there. [`Scenario::Still`] is the opposite
+    /// and just as useless: after the keyframe every codec is perfect.
+    ///
+    /// What a person actually does is scroll to a place and then read it, and
+    /// what matters is how many frames the text takes to come back once the
+    /// motion ends. Bursts rather than one stop, so a run holds several
+    /// settling events and the figure can have a spread instead of being one
+    /// observation.
+    Settle,
 }
 
 impl Scenario {
@@ -56,6 +72,7 @@ impl Scenario {
             "edit" => Scenario::Edit,
             "scroll" => Scenario::Scroll,
             "drag" => Scenario::Drag,
+            "settle" => Scenario::Settle,
             _ => return None,
         })
     }
@@ -67,9 +84,20 @@ impl Scenario {
             Scenario::Edit => "edit",
             Scenario::Scroll => "scroll",
             Scenario::Drag => "drag",
+            Scenario::Settle => "settle",
         }
     }
 }
+
+/// Frames of scrolling in one settle cycle, then frames of holding still.
+///
+/// Twenty at 30 fps is two thirds of a second of scrolling — about one flick of
+/// a wheel — and forty is the one and a third seconds after it, which is long
+/// enough that a codec still smearing at the end of it is not settling at all.
+/// A 300-frame run holds five of these.
+pub const SETTLE_SCROLL: u64 = 20;
+pub const SETTLE_HOLD: u64 = 40;
+pub const SETTLE_CYCLE: u64 = SETTLE_SCROLL + SETTLE_HOLD;
 
 /// Frames between caret toggles. Fifteen at 30 fps is a blink twice a second,
 /// which is what Windows does.
@@ -207,6 +235,18 @@ impl ImageSource {
             }
             Scenario::Edit => vec![self.edit],
             Scenario::Scroll => vec![self.window],
+            // Dirty exactly while the offset is moving, and the two are worked
+            // out from the same rule so they cannot drift apart: a frame
+            // reported as changed that rendered identically would be handed to
+            // the encoder as work it did not have to do, and the settle curve
+            // would start one frame late.
+            Scenario::Settle => {
+                if settle_offset_steps(n) != settle_offset_steps(n - 1) {
+                    vec![self.window]
+                } else {
+                    Vec::new()
+                }
+            }
             // Where it was and where it is. Desktop duplication reports a move
             // this way too, and the two overlap heavily at eight pixels a frame.
             Scenario::Drag => vec![self.dialog_at(n - 1), self.dialog_at(n)],
@@ -235,6 +275,10 @@ impl ImageSource {
         let win_h = (win.bottom - win.top).max(1);
         let offset = match scenario {
             Scenario::Scroll => (frame_no.wrapping_mul(u64::from(self.step)) % win_h as u64) as i32,
+            Scenario::Settle => {
+                let steps = settle_offset_steps(frame_no);
+                (steps.wrapping_mul(u64::from(self.step)) % win_h as u64) as i32
+            }
             _ => 0,
         };
 
@@ -249,7 +293,7 @@ impl ImageSource {
             let wl = (win.left.clamp(0, w as i32) as usize).clamp(x0, x1);
             let wr = (win.right.clamp(0, w as i32) as usize).clamp(x0, x1);
             for y in y0..y1 {
-                let scrolls = scenario == Scenario::Scroll
+                let scrolls = matches!(scenario, Scenario::Scroll | Scenario::Settle)
                     && (y as i32) >= win.top
                     && (y as i32) < win.bottom;
                 if !scrolls {
@@ -294,9 +338,20 @@ impl ImageSource {
                     fill(dst, w, h, caret, [32, 32, 32, 0xFF], rects);
                 }
             }
-            Scenario::Still | Scenario::Scroll => {}
+            Scenario::Still | Scenario::Scroll | Scenario::Settle => {}
         }
     }
+}
+
+/// How many scroll steps have been taken by frame `n` in [`Scenario::Settle`].
+///
+/// Advances through the first [`SETTLE_SCROLL`] frames of each cycle and then
+/// stands still for the rest of it. A free function rather than a method because
+/// both the dirty-rect decision and the render need it, and they must agree.
+fn settle_offset_steps(n: u64) -> u64 {
+    let cycles = n / SETTLE_CYCLE;
+    let within = n % SETTLE_CYCLE;
+    cycles * SETTLE_SCROLL + within.min(SETTLE_SCROLL)
 }
 
 /// Copy one horizontal run of pixels from source row `sy` to destination row
@@ -635,10 +690,57 @@ mod tests {
         }
     }
 
+    /// The whole point of `settle` is that the picture stops. If the pixels
+    /// keep changing through the hold, there is nothing to settle to and the
+    /// measurement is of scrolling under another name.
+    #[test]
+    fn settle_moves_then_actually_stops() {
+        let mut src = source(Scenario::Settle);
+        let mut prev: Option<Vec<u8>> = None;
+        let mut moved_in_scroll = 0;
+        let mut moved_in_hold = 0;
+
+        for n in 0..(SETTLE_CYCLE * 2) {
+            let frame = src
+                .next_frame(Duration::from_millis(1), Readback::Full)
+                .unwrap()
+                .and_then(|f| f.bgra.map(<[u8]>::to_vec));
+            let Some(frame) = frame else { continue };
+            if let Some(before) = &prev {
+                if *before != frame {
+                    // Frame zero is the whole image arriving, not motion.
+                    if n % SETTLE_CYCLE >= 1 && n % SETTLE_CYCLE <= SETTLE_SCROLL {
+                        moved_in_scroll += 1;
+                    } else {
+                        moved_in_hold += 1;
+                    }
+                }
+            }
+            prev = Some(frame);
+        }
+
+        assert!(moved_in_scroll > 0, "во время прокрутки картинка обязана меняться");
+        assert_eq!(moved_in_hold, 0, "после остановки картинка обязана замереть");
+    }
+
+    /// A frame announced as dirty that rendered identically would be charged to
+    /// the encoder as work it never had to do, and would push the settle curve
+    /// one frame late.
+    #[test]
+    fn settle_calls_a_frame_dirty_exactly_when_it_changed() {
+        let src = source(Scenario::Settle);
+        for n in 1..(SETTLE_CYCLE * 3) {
+            let announced = !src.dirty_for(n).is_empty();
+            let moved = settle_offset_steps(n) != settle_offset_steps(n - 1);
+            assert_eq!(announced, moved, "кадр {n}");
+        }
+    }
+
     #[test]
     fn scenarios_parse_and_unknown_ones_do_not() {
         assert_eq!(Scenario::parse("scroll"), Some(Scenario::Scroll));
         assert_eq!(Scenario::parse("drag"), Some(Scenario::Drag));
+        assert_eq!(Scenario::parse("settle"), Some(Scenario::Settle));
         assert_eq!(Scenario::parse("прокрутка"), None);
         assert_eq!(Scenario::parse("full"), None);
     }

@@ -55,6 +55,17 @@ const EDGE_MIN: u16 = 32;
 /// readability has already been judged by eye.
 pub const DAMAGE: [u8; 4] = [8, 16, 24, 32];
 
+/// Which of [`DAMAGE`] the per-frame curve and the readability bar are read at.
+///
+/// The third, meaning 24. Settled against crops: 28% of stroke pixels past it
+/// is indistinguishable from the source, 33% still reads in whole phrases, 44%
+/// has no legible word left. The cliff between 34 and 44 is what makes a bar
+/// possible; the exact place inside that gap is not measured.
+pub const SETTLE_THRESHOLD: usize = 2;
+
+/// Share of damaged stroke pixels above which the text is taken as unreadable.
+pub const BAR: f64 = 0.35;
+
 /// A streaming Y4M reader.
 ///
 /// Streaming rather than loading: a 300-frame 1080p sequence is 889 MB, and two
@@ -159,6 +170,12 @@ pub struct Report {
     pub all_p95: f64,
     /// Mean absolute luma error, for the same reason.
     pub mae: f64,
+    /// The middle threshold's share, one entry per frame, **in frame order**.
+    ///
+    /// Percentiles answer "how bad overall" and cannot answer "how long until
+    /// it comes back", which is the question the `settle` scenario exists to
+    /// ask. A curve is needed for that, and a sorted one is not a curve.
+    pub series: Vec<f64>,
 }
 
 /// Compare two Y4M sequences frame by frame.
@@ -239,6 +256,10 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
         return Err("во втором файле кадров больше, чем в исходнике".to_owned());
     }
 
+    // Taken before the percentiles, which sort in place: the curve is only a
+    // curve while it is still in frame order.
+    let series = edge_series[SETTLE_THRESHOLD].clone();
+
     let mut edge_p50 = [0.0; DAMAGE.len()];
     let mut edge_p95 = [0.0; DAMAGE.len()];
     for k in 0..DAMAGE.len() {
@@ -255,7 +276,47 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
         edge_p95,
         all_p95: percentile(&mut all_series, 0.95),
         mae: error_total as f64 / pixel_total as f64,
+        series,
     })
+}
+
+/// How long the text takes to come back after motion stops.
+///
+/// `cycle` and `scroll` describe the [`Scenario::Settle`] rhythm the sequence
+/// was produced with: each cycle scrolls for `scroll` frames and then holds
+/// still. For every hold this counts the frames from the moment motion ended
+/// until the damage first drops below [`BAR`].
+///
+/// A hold that never gets there is reported as `None` rather than as the length
+/// of the hold, because "did not settle in 40 frames" and "settled on frame 40"
+/// are different findings and averaging them together would hide the first
+/// inside the second.
+///
+/// [`Scenario::Settle`]: spike_capture::image::Scenario::Settle
+pub fn settle_times(series: &[f64], cycle: u64, scroll: u64) -> Vec<Option<u64>> {
+    let mut out = Vec::new();
+    if cycle == 0 || scroll >= cycle {
+        return out;
+    }
+    let mut start = scroll;
+    while (start as usize) < series.len() {
+        let end = (start + (cycle - scroll)).min(series.len() as u64);
+        let mut found = None;
+        for (waited, i) in (start..end).enumerate() {
+            if series[i as usize] < BAR {
+                found = Some(waited as u64);
+                break;
+            }
+        }
+        // Only complete holds are reported: a run that stopped in the middle of
+        // one would otherwise contribute a "never settled" that is really just
+        // the end of the file.
+        if end - start == cycle - scroll {
+            out.push(found);
+        }
+        start += cycle;
+    }
+    out
 }
 
 /// Nearest-rank, the same rule the rest of the harness reports percentiles by.
@@ -297,6 +358,63 @@ impl Report {
             self.mae
         ));
         out
+    }
+
+    /// The settle report, for a sequence produced by the `settle` scenario.
+    ///
+    /// Refuses to guess: if the caller did not say what rhythm the frames were
+    /// made with, there is no way to know where a hold begins, and a curve read
+    /// against the wrong cycle would produce confident nonsense.
+    pub fn render_settle(&self, cycle: u64, scroll: u64) -> String {
+        let times = settle_times(&self.series, cycle, scroll);
+        let mut out = format!(
+            "\n  Оседание после остановки, порог {}% испорченных штрихов:\n",
+            (BAR * 100.0) as u32
+        );
+        if times.is_empty() {
+            out.push_str("  ни одной полной остановки в этой записи\n");
+            return out;
+        }
+
+        let settled: Vec<u64> = times.iter().filter_map(|t| *t).collect();
+        let never = times.len() - settled.len();
+        for (i, t) in times.iter().enumerate() {
+            match t {
+                Some(f) => out.push_str(&format!(
+                    "    остановка {}: текст собрался через {f} кадр(ов), {:.0} мс\n",
+                    i + 1,
+                    *f as f64 * 1000.0 / 30.0
+                )),
+                None => out.push_str(&format!(
+                    "    остановка {}: НЕ СОБРАЛСЯ за {} кадров\n",
+                    i + 1,
+                    cycle - scroll
+                )),
+            }
+        }
+        if !settled.is_empty() {
+            let worst = settled.iter().copied().max().unwrap_or(0);
+            out.push_str(&format!(
+                "\n  худшее из собравшихся: {worst} кадр(ов), {:.0} мс\n",
+                worst as f64 * 1000.0 / 30.0
+            ));
+        }
+        if never > 0 {
+            out.push_str(&format!("  не собралось вовсе: {never} из {}\n", times.len()));
+        }
+        out
+    }
+
+    /// Write the per-frame curve, one line per frame.
+    pub fn write_series(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut f = File::create(path)
+            .map_err(|e| format!("не создать {}: {e}", path.display()))?;
+        writeln!(f, "frame,damaged_share").map_err(|e| format!("запись: {e}"))?;
+        for (i, v) in self.series.iter().enumerate() {
+            writeln!(f, "{i},{v:.6}").map_err(|e| format!("запись: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -399,6 +517,30 @@ mod tests {
         for p in [&a, &on_edge, &on_flat] {
             std::fs::remove_file(p).ok();
         }
+    }
+
+    #[test]
+    fn settle_time_is_counted_from_the_moment_motion_stopped() {
+        // Cycle of 10: four frames scrolling, six holding.
+        // Hold one recovers on the third held frame, hold two never does.
+        let bad = 0.9;
+        let good = 0.1;
+        let series = vec![
+            bad, bad, bad, bad, // scroll
+            bad, bad, good, good, good, good, // hold: settles after 2
+            bad, bad, bad, bad, // scroll
+            bad, bad, bad, bad, bad, bad, // hold: never
+        ];
+        let t = settle_times(&series, 10, 4);
+        assert_eq!(t, vec![Some(2), None]);
+    }
+
+    /// A hold cut short by the end of the file is not evidence of anything, and
+    /// counting it as "never settled" would slander whatever produced it.
+    #[test]
+    fn an_incomplete_hold_is_dropped_rather_than_counted_as_a_failure() {
+        let series = vec![0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+        assert_eq!(settle_times(&series, 10, 4), Vec::<Option<u64>>::new());
     }
 
     #[test]
