@@ -67,4 +67,17 @@ impl Codec {
             Codec::Vp9 => "VP9",
         }
     }
+
+    /// The four bytes that name this codec inside a container.
+    ///
+    /// Lives here rather than next to the writer that needs it because the
+    /// writer must not depend on the `vpx` feature, and this enum already does
+    /// not. `None` for [`Codec::None`], which has no bitstream to name.
+    pub fn fourcc(self) -> Option<[u8; 4]> {
+        match self {
+            Codec::None => None,
+            Codec::Vp8 => Some(*b"VP80"),
+            Codec::Vp9 => Some(*b"VP90"),
+        }
+    }
 }

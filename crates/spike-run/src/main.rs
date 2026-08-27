@@ -22,6 +22,11 @@ mod bmp;
 /// own — the conversion to I420 happens either way.
 mod yuv;
 
+/// Our own encoder's bitstream, written out for a decoder that is not ours.
+/// The other direction of the same comparison; see the module for why either
+/// one alone settles nothing.
+mod ivf;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -121,6 +126,8 @@ struct Args {
     drop_frame: Option<u64>,
     /// Write the frames the encoder would see to a file, and stop.
     export: Option<PathBuf>,
+    /// Encode with this run's own settings, write the bitstream, and stop.
+    emit: Option<PathBuf>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -166,6 +173,7 @@ impl Default for Args {
             dump: None,
             drop_frame: None,
             export: None,
+            emit: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -428,6 +436,13 @@ fn usage() -> &'static str {
                                        и нужен аппаратному пути, чтобы в замер не
                                        вошла чужая перепаковка плоскостей.
                                        Только с воспроизводимым источником
+    --emit-ivf <файл>                  закодировать те же кадры ключами этого
+                                       прогона и записать сам битстрим, потом
+                                       выйти. Обратная сторона --export-yuv: тот
+                                       отдаёт наши кадры чужому кодеру, этот
+                                       отдаёт наш кодек чужой мерке. Пока нет
+                                       обоих, сравнивать не с чем.
+                                       Только с воспроизводимым источником
     --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
                                        показывает, что видит получатель после
                                        потерянного пакета и надолго ли
@@ -494,6 +509,7 @@ fn parse_args() -> Result<Args, String> {
             "--grab" => args.grab = Some(PathBuf::from(value()?)),
             "--dump" => args.dump = Some(PathBuf::from(value()?)),
             "--export-yuv" => args.export = Some(PathBuf::from(value()?)),
+            "--emit-ivf" => args.emit = Some(PathBuf::from(value()?)),
             "--drop-frame" => {
                 let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
                 args.drop_frame = Some(n);
@@ -760,6 +776,125 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
     println!("\nЭто ровно те плоскости, которые получил бы наш кодер при --scale {}.", args.scale);
     println!("Отпечаток печатается для того, чтобы это можно было проверить, а не");
     println!("принимать на слово: два экспорта одних и тех же кадров дают его же.");
+    Ok(())
+}
+
+/// Encode a reproducible sequence with this run's own settings and write the
+/// bitstream out.
+///
+/// The mirror of [`export`], and the pair only works as a pair. Exporting
+/// frames lets encoders we do not have compete on our content; without this,
+/// our own codec can only join that table through somebody else's build of
+/// libvpx, tuned by somebody else. That is how the VP9 row of the codec
+/// comparison came to be measured on a configuration this project does not run
+/// — one that could not go below about 2,5 Mbit/s on the screenshot where this
+/// harness holds 1,85.
+///
+/// Deliberately its own pass rather than a side channel on the measured run.
+/// [`spike_encode::vpx::VpxEncoder::encode_keeping`] allocates, and the measured
+/// path is documented as never allocating; a screenshot source is deterministic
+/// by frame number, so a second pass encodes the same planes with the same
+/// settings and produces the same bytes. The fingerprint printed at the end is
+/// how that claim is checked rather than believed.
+fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
+    let Some(fourcc) = args.codec.fourcc() else {
+        return Err("нечего писать: кодек не выбран. Добавьте --encode vp9".to_owned());
+    };
+    if path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref()
+        != Some("ivf")
+    {
+        return Err("битстрим пишется в IVF — назовите файл .ivf".to_owned());
+    }
+    if !args.compare.is_empty() {
+        return Err("--emit-ivf пишет один поток, а --compare задаёт несколько.\n\
+                    Выпишите каждую конфигурацию отдельным прогоном."
+            .to_owned());
+    }
+    if !args.source.starts_with("image:") && !args.source.starts_with("synthetic") {
+        return Err(format!(
+            "битстрим пишется только с воспроизводимого источника, а «{}» таким\n\
+             не является. Второй проход по живому экрану закодирует другие кадры,\n\
+             и качество будет сравниваться с чужим содержимым. Снимите снимок\n\
+             через --grab и пишите с него.",
+            args.source
+        ));
+    }
+
+    let mut source = build_source(args)?;
+    let (w, h) = source.dimensions();
+    let mut plane = I420::new(w, h, args.scale);
+    let mut encoder =
+        build_encoder(args, plane.width, plane.height)?.ok_or("кодер не построился")?;
+    let want = args.frames.unwrap_or(300).max(1);
+
+    println!("Источник: {}", source.describe());
+    println!(
+        "Кодирую {want} кадров {}×{} — {} при {} кбит/с, cpu-used {}, потоков {} — в {} …",
+        plane.width,
+        plane.height,
+        args.codec.name(),
+        args.bitrate_kbps,
+        args.cpu_used,
+        args.threads,
+        path.display()
+    );
+
+    let mut writer = ivf::Writer::create(path, fourcc, plane.width, plane.height, args.fps)?;
+    let mut payload: Vec<u8> = Vec::new();
+    let mut done = 0u64;
+    let mut keyframes = 0u64;
+    let mut dropped = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(600);
+
+    while done < want && Instant::now() < deadline {
+        let grabbed = match source.next_frame(Duration::from_millis(200), Readback::Full) {
+            Ok(Some(f)) => f.bgra.map(|b| (f.width, f.height, f.stride, b.to_vec())),
+            Ok(None) => None,
+            Err(CaptureError::AccessLost) => {
+                source.reinit().map_err(|e| e.to_string())?;
+                None
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let Some((fw, fh, stride, bgra)) = grabbed else { continue };
+
+        // Whole frame, exactly as in `export` and for the same reason: the
+        // encoder must be handed a complete picture, not the dirty regions the
+        // measured path converts.
+        let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
+        plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+
+        payload.clear();
+        let out = encode_one_keeping(&mut encoder, &plane, &mut payload)?;
+        done += 1;
+        if out.keyframe {
+            keyframes += 1;
+        }
+        if out.dropped {
+            // No packet, so no IVF frame — and the decoder will hand back fewer
+            // pictures than we counted. Reported for that reason: a frame count
+            // that does not match is otherwise read as a broken writer.
+            dropped += 1;
+            continue;
+        }
+        writer.frame(&payload)?;
+    }
+
+    if done < want {
+        return Err(format!("успел закодировать только {done} кадров из {want}"));
+    }
+
+    let (frames, bytes, fingerprint) = writer.finish()?;
+    let seconds = frames as f64 / f64::from(args.fps.max(1));
+    let kbps = if seconds > 0.0 { bytes as f64 * 8.0 / seconds / 1000.0 } else { 0.0 };
+
+    println!("\nЗаписано: {frames} кадров, {bytes} Б сжатых данных");
+    println!("  {kbps:.0} кбит/с при {} к/с, {:.0} Б на кадр", args.fps, bytes as f64 / frames as f64);
+    println!("  ключевых кадров {keyframes}, кодер выбросил {dropped}");
+    println!("  отпечаток битстрима {fingerprint}");
+    println!("\nЭто наш кодер на наших настройках. Чтобы число легло на ту же ось,");
+    println!("что и чужие кодеки, декодируйте файл и сравните с --export-yuv тех же");
+    println!("кадров: содержимое совпадёт до байта, а разойдётся только качество.");
     Ok(())
 }
 
@@ -1111,6 +1246,28 @@ fn encode_one(enc: &mut Never, _yuv: &I420) -> Result<spike_encode::Encoded, Str
     match *enc {}
 }
 
+/// As [`encode_one`], but keeping the compressed bytes.
+///
+/// Separate call site rather than a flag on the other, so the measured path
+/// cannot acquire an allocation by someone passing the wrong argument.
+#[cfg(feature = "vpx")]
+fn encode_one_keeping(
+    enc: &mut spike_encode::vpx::VpxEncoder,
+    yuv: &I420,
+    payload: &mut Vec<u8>,
+) -> Result<spike_encode::Encoded, String> {
+    enc.encode_keeping(yuv, payload)
+}
+
+#[cfg(not(feature = "vpx"))]
+fn encode_one_keeping(
+    enc: &mut Never,
+    _yuv: &I420,
+    _payload: &mut Vec<u8>,
+) -> Result<spike_encode::Encoded, String> {
+    match *enc {}
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -1153,6 +1310,14 @@ fn main() {
 
     if let Some(path) = args.export.clone() {
         if let Err(e) = export(&args, &path) {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(path) = args.emit.clone() {
+        if let Err(e) = emit_bitstream(&args, &path) {
             eprintln!("\nОшибка: {e}");
             std::process::exit(1);
         }
