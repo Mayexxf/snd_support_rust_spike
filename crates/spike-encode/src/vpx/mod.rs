@@ -137,6 +137,31 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Rate-control buffer, in **milliseconds**, which is the unit libvpx uses.
+    ///
+    /// Readable from here rather than written straight into the config, because
+    /// the same figure has to be handed to ffmpeg — where the corresponding
+    /// `-bufsize` is in **bits**. Spelled out by hand, the two came out a factor
+    /// of two apart: `-bufsize ${k}k` beside `-b:v ${k}k` is a full second,
+    /// against 500 ms here, and our encoder ran the whole comparison on half the
+    /// buffer of every row it was measured against.
+    ///
+    /// A small buffer keeps rate control reacting quickly, which matters more
+    /// than a smooth bitrate when the screen alternates between still and
+    /// scrolling.
+    pub fn rc_buf_ms(&self) -> u32 {
+        500
+    }
+
+    /// Frames between forced keyframes.
+    ///
+    /// Ten seconds. Readable for the same reason: the VP9 row of the published
+    /// table was given no `-g` at all and quietly took libvpx's own default of
+    /// 128, while every other row had 300 typed out beside it.
+    pub fn kf_max_dist(&self) -> u32 {
+        self.fps * 10
+    }
+
     pub fn new(width: u32, height: u32, fps: u32) -> Self {
         Self {
             width,
@@ -209,14 +234,14 @@ impl VpxEncoder {
         // A small buffer keeps rate control reacting quickly, which matters more
         // than a smooth bitrate when the screen alternates between still and
         // scrolling.
-        cfg.rc_buf_sz = 500;
+        cfg.rc_buf_sz = settings.rc_buf_ms();
         cfg.rc_buf_initial_sz = 250;
         cfg.rc_buf_optimal_sz = 300;
         cfg.kf_mode = ffi::VPX_KF_AUTO;
         // Keyframes are the most expensive thing this encoder does — on screen
         // content they can be fifty times a delta frame. Ten seconds apart is a
         // compromise; a lossy link may force more.
-        cfg.kf_max_dist = settings.fps * 10;
+        cfg.kf_max_dist = settings.kf_max_dist();
 
         let mut ctx = ffi::vpx_codec_ctx::default();
         // SAFETY: ctx and cfg are live. The ABI version is expanded from the

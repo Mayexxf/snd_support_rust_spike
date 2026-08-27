@@ -92,6 +92,29 @@ function Get-RealisedConfig([string]$file) {
 # Все аппаратные строки во всех трёх отчётах были сняты именно так, и это не
 # заметили, потому что число выглядело правдоподобно. Проверка стоит одного вызова
 # ffprobe -- дешевле, чем ещё раз узнать об этом из отчёта.
+# Ключи ffmpeg, ПОРОЖДЁННЫЕ из настроек нашего кодера.
+#
+# Рукописные ключи в этих скриптах пропустили четыре расхождения подряд, и ни
+# одно не было видно в своей половине: ключевой кадр 128 против 300, буфер вдвое
+# меньше (у libvpx миллисекунды, у ffmpeg биты), переупорядочивание кадров у QSV
+# и экранный режим только у нас. Обе половины по отдельности выглядели разумно и
+# вместе были неверны.
+#
+# Возвращает массив строк для передачи ffmpeg. Оговорки печатаются: то, что
+# сопоставить нельзя, не повод молчать об этом -- это и есть блок оговорок,
+# который обязана нести таблица.
+function Get-PlanArgs([string]$target, [int]$kbps) {
+  $out = & $SweepBin --plan $target --bitrate $kbps --encode vp9 2>&1 | Out-String
+  $lines = $out -split "`r?`n"
+  $argv = $null
+  foreach ($l in $lines) {
+    if ($l.TrimStart().StartsWith("-c:v")) { $argv = $l.Trim(); break }
+  }
+  if (-not $argv) { throw "не удалось получить ключи для $target :`n$out" }
+  foreach ($l in $lines) { if ($l.StartsWith("#")) { Write-Host "  $l" } }
+  return $argv -split " "
+}
+
 function Assert-NoReorder([string]$tag, [string]$file) {
   $c = Get-RealisedConfig $file
   if ($c.reorder -gt 0 -or $c.has_b -ne "0") {
@@ -99,4 +122,41 @@ function Assert-NoReorder([string]$tag, [string]$file) {
     return $false
   }
   return $true
+}
+
+# Заслон по РЕЗУЛЬТАТУ, а не по переданным ключам.
+#
+# Ключ, который драйвер принял и проигнорировал, ключами не ловится: QSV молча
+# съел -global_quality и выдал одинаковые байты в четырёх точках. Отличает
+# только чтение самого битстрима. Проверяется переупорядочивание и фактический
+# интервал ключевых кадров -- строка с чужим GOP несравнима, сколько бы -g ей
+# ни передали.
+#
+# Возвращает $true, если строку можно печатать в сводку.
+function Test-RowIsComparable([string]$tag, [string]$file, [int]$expectedGop, [int]$frames) {
+  $c = Get-RealisedConfig $file
+  $ok = $true
+
+  if ($c.reorder -gt 0 -or $c.has_b -ne "0") {
+    Write-Host "  ОТКАЗ $tag : переупорядочивание (has_b=$($c.has_b), pts<>dts $($c.reorder))"
+    $ok = $false
+  }
+
+  # Сколько ключевых кадров должно быть при таком интервале.
+  $want = [math]::Max(1, [math]::Ceiling($frames / [double]$expectedGop))
+  if ($c.keyframes -ne $want) {
+    Write-Host "  ОТКАЗ $tag : ключевых кадров $($c.keyframes), ожидалось $want при -g $expectedGop"
+    Write-Host "         (у строки VP9 в опубликованной таблице их было 3 вместо 1: ключ -g просто не передали)"
+    $ok = $false
+  }
+
+  if ($c.frames -ne $frames) {
+    Write-Host "  ОТКАЗ $tag : кадров $($c.frames), ожидалось $frames"
+    $ok = $false
+  }
+
+  if ($ok) {
+    Write-Host "  $tag : I=$($c.keyframes) P=$($c.p_frames) B=$($c.b_frames) has_b=$($c.has_b) reorder=$($c.reorder)"
+  }
+  return $ok
 }

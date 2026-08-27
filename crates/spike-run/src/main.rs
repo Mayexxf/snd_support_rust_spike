@@ -35,6 +35,11 @@ mod quality;
 /// for the collapse it exists to make impossible.
 mod chain;
 
+/// ffmpeg's arguments, generated from the settings that configure our own
+/// encoder, plus everything that could not be expressed in them.
+#[cfg(feature = "vpx")]
+mod parity;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -141,6 +146,8 @@ struct Args {
     quality: Option<(PathBuf, PathBuf)>,
     /// Also write the per-frame curve there.
     quality_csv: Option<PathBuf>,
+    /// Print ffmpeg's arguments for this target, generated from our settings.
+    plan: Option<String>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -189,6 +196,7 @@ impl Default for Args {
             emit: None,
             quality: None,
             quality_csv: None,
+            plan: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -476,6 +484,15 @@ fn usage() -> &'static str {
                                        том, за сколько кадров текст собирается
                                        после каждой остановки
     --quality-csv <файл>               заодно выписать покадровую кривую
+    --plan <кодек>                     напечатать ключи ffmpeg для этого кодера,
+                                       ПОРОЖДЁННЫЕ из настроек нашего, плюс
+                                       список того, что сопоставить не удалось.
+                                       Есть libx264, h264_qsv, hevc_qsv,
+                                       libvpx-vp9, libvpx. Рукописные ключи
+                                       пропустили четыре расхождения подряд:
+                                       ключевой кадр 128 против 300, буфер вдвое
+                                       меньше (мс против бит), переупорядочивание
+                                       кадров и экранный режим только у нас
     --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
                                        показывает, что видит получатель после
                                        потерянного пакета и надолго ли
@@ -551,6 +568,7 @@ fn parse_args() -> Result<Args, String> {
                 args.quality = Some((src, test));
             }
             "--quality-csv" => args.quality_csv = Some(PathBuf::from(value()?)),
+            "--plan" => args.plan = Some(value()?),
             "--drop-frame" => {
                 let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
                 args.drop_frame = Some(n);
@@ -970,6 +988,8 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let mut keyframes = 0u64;
     let mut have = false;
     let mut chain = chain::Chain::new();
+    let mut decoder = spike_encode::vpx::decode::VpxDecoder::new(args.codec)?;
+    let mut decoded_hash: u64 = 0xcbf2_9ce4_8422_2325;
     let deadline = Instant::now() + Duration::from_secs(600);
 
     while done < want && Instant::now() < deadline {
@@ -1029,6 +1049,35 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
                 done - 1
             ));
         }
+
+        // Decoded straight back and folded into a fingerprint of the pictures a
+        // receiver would see. Two sweep rows that are secretly one operating
+        // point — libvpx pinned at its quantizer ceiling and stuffing bits to
+        // meet a minrate it cannot use — produce different byte counts and
+        // identical pictures. That happened: two rate points of the VP9 row
+        // matched to four decimal places on all eight readability percentiles,
+        // and it took two reports to notice. Byte counts cannot tell; this can.
+        //
+        // It also means the bitstream has been read by a decoder before it is
+        // handed to somebody else's.
+        match decoder.decode(&payload) {
+            Ok(Some(pic)) => {
+                for b in pic.y {
+                    decoded_hash ^= u64::from(b);
+                    decoded_hash = decoded_hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(format!(
+                    "наш же декодер не принял кадр {}: {e}\n\
+                     Битстрим, который не читается нашим декодером, незачем\n\
+                     отдавать чужому.",
+                    done - 1
+                ));
+            }
+        }
+
         writer.frame(&payload)?;
     }
 
@@ -1044,6 +1093,7 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     println!("  {kbps:.0} кбит/с при {} к/с, {:.0} Б на кадр", args.fps, bytes as f64 / frames as f64);
     println!("  ключевых кадров {keyframes}");
     println!("  отпечаток битстрима {fingerprint}");
+    println!("  отпечаток декодированного {decoded_hash:016x}");
     println!("{}", chain.render());
     println!("\nЧем это снято:");
     print!("{}", stamp(args, true));
@@ -1060,6 +1110,7 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let mut note = String::from("\u{feff}");
     note.push_str(&stamp(args, true));
     note.push_str(&format!("  отпечаток битстрима {fingerprint}\n"));
+    note.push_str(&format!("  отпечаток декодированного {decoded_hash:016x}\n"));
     note.push_str(&chain.render());
     note.push('\n');
     match std::fs::write(&side, note) {
@@ -1083,6 +1134,32 @@ fn unpaced(args: &Args) -> Args {
     let mut out = args.clone();
     out.frames = Some(args.frames.unwrap_or(300).max(1));
     out
+}
+
+/// Print ffmpeg's arguments for one target, from our own encoder's settings.
+///
+/// Exists so the sweep scripts stop spelling the flags out by hand. Four parity
+/// breaks survived that arrangement, and none of them was visible in either
+/// half alone: the two sides were separately plausible and jointly wrong.
+#[cfg(feature = "vpx")]
+fn print_plan(args: &Args, target: &str) -> Result<(), String> {
+    let target = parity::Target::parse(target).ok_or(format!(
+        "неизвестная цель «{target}». Есть libx264, h264_qsv, hevc_qsv, libvpx-vp9, libvpx"
+    ))?;
+    // Geometry is not part of the comparison — ffmpeg takes it from the Y4M —
+    // but Settings wants it, so it comes from the same keys a real run uses.
+    let (w, h) = (args.width / args.scale.max(1), args.height / args.scale.max(1));
+    let settings = encoder_settings(args, w & !1, h & !1)?;
+    print!("{}", parity::plan(&settings, target).render());
+    Ok(())
+}
+
+#[cfg(not(feature = "vpx"))]
+fn print_plan(_args: &Args, _target: &str) -> Result<(), String> {
+    Err("стенд собран без libvpx: порождать ключи не из чего.\n\
+         Ключи ffmpeg выводятся из настроек НАШЕГО кодера, и без него\n\
+         это была бы ещё одна рукописная копия — ровно то, что убирается."
+        .to_owned())
 }
 
 fn grab(args: &Args, path: &Path) -> Result<(), String> {
@@ -1520,6 +1597,14 @@ fn main() {
         if let Err(e) = export(&args, &path) {
             eprintln!("\nОшибка: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(target) = args.plan.clone() {
+        if let Err(e) = print_plan(&args, &target) {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(2);
         }
         return;
     }
