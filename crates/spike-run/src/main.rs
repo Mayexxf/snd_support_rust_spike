@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "vpx")]
 mod bmp;
 
+/// Frames written out for an encoder that is not ours. Needs no codec of its
+/// own — the conversion to I420 happens either way.
+mod yuv;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -115,6 +119,8 @@ struct Args {
     dump: Option<PathBuf>,
     /// Withhold this frame from the decoder, to see what a lost packet costs.
     drop_frame: Option<u64>,
+    /// Write the frames the encoder would see to a file, and stop.
+    export: Option<PathBuf>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -159,6 +165,7 @@ impl Default for Args {
             grab: None,
             dump: None,
             drop_frame: None,
+            export: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -415,6 +422,12 @@ fn usage() -> &'static str {
                                        раньше нижней: при масштабе 1 кодер достаёт
                                        до потолка и промахивается мимо битрейта
                                        вместо того, чтобы сжать сильнее
+    --export-yuv <файл>                записать кадры, которые получил бы кодер,
+                                       и выйти. Формат по расширению: .y4m несёт
+                                       размер и частоту в заголовке, .nv12 сырой
+                                       и нужен аппаратному пути, чтобы в замер не
+                                       вошла чужая перепаковка плоскостей.
+                                       Только с воспроизводимым источником
     --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
                                        показывает, что видит получатель после
                                        потерянного пакета и надолго ли
@@ -480,6 +493,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--grab" => args.grab = Some(PathBuf::from(value()?)),
             "--dump" => args.dump = Some(PathBuf::from(value()?)),
+            "--export-yuv" => args.export = Some(PathBuf::from(value()?)),
             "--drop-frame" => {
                 let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
                 args.drop_frame = Some(n);
@@ -662,6 +676,93 @@ fn build_image(args: &Args, path: &Path) -> Result<Box<dyn FrameSource>, String>
 /// Whatever `--source` says is what gets grabbed, so a synthetic frame can be
 /// saved on a machine with no desktop duplication — which is how the replay path
 /// gets tested without Windows.
+/// Write out the frames the encoder would have been handed, and stop.
+///
+/// Exists so the codec choice can be settled against encoders this harness does
+/// not contain. Writing our own FFI to the hardware path is days before the
+/// first number; handing the same frames to a tool that already speaks to it is
+/// an afternoon — but only if they really are the same frames, which is why the
+/// conversion here is the same `I420` the encoder gets, built the same way, and
+/// why a fingerprint over every emitted byte is printed at the end.
+///
+/// Refuses a live source, and that refusal is the point rather than a
+/// limitation. A second pass over `dda` captures a different desktop, so the
+/// exported file would not hold the frames any measured run encoded, and every
+/// comparison built on it would be quietly about two different things. A
+/// screenshot source is deterministic by frame number, so a separate pass gives
+/// back the same planes to the byte.
+fn export(args: &Args, path: &Path) -> Result<(), String> {
+    let layout = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) if yuv::Layout::parse(e).is_some() => yuv::Layout::parse(e).unwrap(),
+        Some(e) => {
+            return Err(format!(
+                "по расширению «{e}» не понять формат. Назовите файл .y4m или .nv12"
+            ));
+        }
+        None => return Err("у файла нет расширения — назовите его .y4m или .nv12".to_owned()),
+    };
+
+    if !args.source.starts_with("image:") && !args.source.starts_with("synthetic") {
+        return Err(format!(
+            "экспорт идёт только с воспроизводимого источника, а «{}» таким не является.\n\
+             Живой экран во втором проходе даст другие кадры, и сравнивать по ним\n\
+             будет нечего. Снимите снимок через --grab и экспортируйте с него.",
+            args.source
+        ));
+    }
+
+    let mut source = build_source(args)?;
+    let (w, h) = source.dimensions();
+    let mut plane = I420::new(w, h, args.scale);
+    let want = args.frames.unwrap_or(300).max(1);
+
+    println!("Источник: {}", source.describe());
+    println!(
+        "Пишу {want} кадров {}×{} в {} ({}) …",
+        plane.width,
+        plane.height,
+        path.display(),
+        layout.name()
+    );
+
+    let mut writer = yuv::Writer::create(path, layout, plane.width, plane.height, args.fps)?;
+    let mut done = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(300);
+
+    while done < want && Instant::now() < deadline {
+        let grabbed = match source.next_frame(Duration::from_millis(200), Readback::Full) {
+            Ok(Some(f)) => f.bgra.map(|b| (f.width, f.height, f.stride, b.to_vec())),
+            Ok(None) => None,
+            Err(CaptureError::AccessLost) => {
+                source.reinit().map_err(|e| e.to_string())?;
+                None
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let Some((fw, fh, stride, bgra)) = grabbed else { continue };
+
+        // Whole-frame conversion, not the dirty regions: the file has to hold a
+        // complete picture per frame however little of it moved. The measured
+        // path converts only what changed, which is right there and wrong here.
+        let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
+        plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+        writer.frame(&plane)?;
+        done += 1;
+    }
+
+    if done < want {
+        return Err(format!("успел записать только {done} кадров из {want}"));
+    }
+
+    let (frames, bytes, fingerprint) = writer.finish()?;
+    println!("\nЗаписано: {frames} кадров, {} МБ", bytes / 1_048_576);
+    println!("  отпечаток кадров {fingerprint}");
+    println!("\nЭто ровно те плоскости, которые получил бы наш кодер при --scale {}.", args.scale);
+    println!("Отпечаток печатается для того, чтобы это можно было проверить, а не");
+    println!("принимать на слово: два экспорта одних и тех же кадров дают его же.");
+    Ok(())
+}
+
 fn grab(args: &Args, path: &Path) -> Result<(), String> {
     let mut source = build_source(args)?;
     println!("Источник: {}", source.describe());
@@ -1044,6 +1145,14 @@ fn main() {
 
     if let Some(path) = args.grab.clone() {
         if let Err(e) = grab(&args, &path) {
+            eprintln!("\nОшибка: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(path) = args.export.clone() {
+        if let Err(e) = export(&args, &path) {
             eprintln!("\nОшибка: {e}");
             std::process::exit(1);
         }
