@@ -1453,6 +1453,16 @@ fn main() {
     }
 
     if let Some((src, test)) = args.quality.clone() {
+        // Said out loud rather than silently overridden: `--fps` is a capture
+        // key, and a scoring run has no capture. The rate that matters here is
+        // the one written into the two files, and taking it from a flag instead
+        // is exactly how the millisecond column came to assume thirty.
+        if args.fps != DEFAULT_FPS {
+            eprintln!(
+                "· --fps {} не влияет на --quality: частота берётся из заголовков файлов",
+                args.fps
+            );
+        }
         match quality::compare(&src, &test) {
             Ok(report) => {
                 print!("{}", report.render());

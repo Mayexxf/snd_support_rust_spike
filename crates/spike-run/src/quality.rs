@@ -74,6 +74,14 @@ struct Reader {
     inner: BufReader<File>,
     width: usize,
     height: usize,
+    /// Frames per second, from the `F` tag. Rounded to whole frames.
+    ///
+    /// Read because a settling time in milliseconds is a frame count divided by
+    /// a rate, and the rate has to come from the frames themselves. It used to
+    /// be a hard-coded thirty sitting next to a `--fps` the operator was free to
+    /// change, which is a trap rather than a bug only because nothing on disk
+    /// was ever exported at another rate.
+    fps: f64,
     frame: Vec<u8>,
     /// Bytes of one frame body: luma plus both chroma planes.
     body: usize,
@@ -91,23 +99,46 @@ impl Reader {
 
         let mut width = 0usize;
         let mut height = 0usize;
+        let mut fps = 0.0f64;
         for tag in header.split_ascii_whitespace().skip(1) {
             let (kind, value) = tag.split_at(1);
             match kind {
                 "W" => width = value.parse().map_err(|_| format!("ширина «{value}» не число"))?,
                 "H" => height = value.parse().map_err(|_| format!("высота «{value}» не число"))?,
+                // Y4M states the rate as a ratio, `F30:1`. A denominator of one
+                // is what this harness writes, but ffmpeg is free to hand back
+                // `F30000:1001`, so it is divided rather than assumed.
+                "F" => {
+                    let (num, den) = value
+                        .split_once(':')
+                        .ok_or(format!("частота «{value}» не вида 30:1"))?;
+                    let num: f64 = num.parse().map_err(|_| format!("числитель «{num}» не число"))?;
+                    let den: f64 = den.parse().map_err(|_| format!("знаменатель «{den}» не число"))?;
+                    if den <= 0.0 {
+                        return Err(format!("частота «{value}» с нулевым знаменателем"));
+                    }
+                    fps = num / den;
+                }
                 _ => {}
             }
         }
         if width == 0 || height == 0 {
             return Err(format!("{} не сообщает размер кадра", path.display()));
         }
+        if fps <= 0.0 {
+            return Err(format!(
+                "{} не сообщает частоту кадров (тег F).\n\
+                 Без неё кадры не перевести в миллисекунды, а перевести их по\n\
+                 умолчанию в тридцать — это напечатать неверное время как верное.",
+                path.display()
+            ));
+        }
 
         // Chroma is read and thrown away rather than skipped by seeking: the
         // point is to advance the stream, and a seek would stop this working
         // the day the input arrives on a pipe.
         let body = width * height + 2 * (width / 2) * (height / 2);
-        Ok(Self { inner, width, height, frame: vec![0; body], body })
+        Ok(Self { inner, width, height, fps, frame: vec![0; body], body })
     }
 
     /// Read one frame and hand back its luma plane, or `None` at end of file.
@@ -170,6 +201,8 @@ pub struct Report {
     pub all_p95: f64,
     /// Mean absolute luma error, for the same reason.
     pub mae: f64,
+    /// The rate both files declared, carried so nothing downstream has to guess.
+    pub fps: f64,
     /// The middle threshold's share, one entry per frame, **in frame order**.
     ///
     /// Percentiles answer "how bad overall" and cannot answer "how long until
@@ -188,7 +221,19 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
             a.width, a.height, b.width, b.height
         ));
     }
+    // A rate mismatch means the two files are not the same recording, however
+    // well their frame counts happen to line up. Refused rather than resolved in
+    // favour of one of them: picking either would put a plausible millisecond
+    // column under a comparison that is already meaningless.
+    if (a.fps - b.fps).abs() > 1e-6 {
+        return Err(format!(
+            "{:.3} к/с против {:.3} к/с — это записи разной частоты,\n\
+             сравнивать их покадрово нечего",
+            a.fps, b.fps
+        ));
+    }
     let (w, h) = (a.width, a.height);
+    let fps = a.fps;
 
     let mut edge_series: Vec<Vec<f64>> = vec![Vec::new(); DAMAGE.len()];
     let mut all_series: Vec<f64> = Vec::new();
@@ -276,6 +321,7 @@ pub fn compare(src: &Path, test: &Path) -> Result<Report, String> {
         edge_p95,
         all_p95: percentile(&mut all_series, 0.95),
         mae: error_total as f64 / pixel_total as f64,
+        fps,
         series,
     })
 }
@@ -366,9 +412,16 @@ impl Report {
     /// made with, there is no way to know where a hold begins, and a curve read
     /// against the wrong cycle would produce confident nonsense.
     pub fn render_settle(&self, cycle: u64, scroll: u64) -> String {
+        // The rate comes off `self`, which got it from the files. There is
+        // deliberately no parameter and no default: a caller able to supply the
+        // rate is a caller able to supply the wrong one, and the wrong one here
+        // prints a confident millisecond column nobody can tell is off.
+        let fps = self.fps;
+        let ms = |frames: u64| frames as f64 * 1000.0 / fps;
+
         let times = settle_times(&self.series, cycle, scroll);
         let mut out = format!(
-            "\n  Оседание после остановки, порог {}% испорченных штрихов:\n",
+            "\n  Оседание после остановки, порог {}% испорченных штрихов, {fps:.0} к/с:\n",
             (BAR * 100.0) as u32
         );
         if times.is_empty() {
@@ -383,7 +436,7 @@ impl Report {
                 Some(f) => out.push_str(&format!(
                     "    остановка {}: текст собрался через {f} кадр(ов), {:.0} мс\n",
                     i + 1,
-                    *f as f64 * 1000.0 / 30.0
+                    ms(*f)
                 )),
                 None => out.push_str(&format!(
                     "    остановка {}: НЕ СОБРАЛСЯ за {} кадров\n",
@@ -396,7 +449,7 @@ impl Report {
             let worst = settled.iter().copied().max().unwrap_or(0);
             out.push_str(&format!(
                 "\n  худшее из собравшихся: {worst} кадр(ов), {:.0} мс\n",
-                worst as f64 * 1000.0 / 30.0
+                ms(worst)
             ));
         }
         if never > 0 {
@@ -425,8 +478,12 @@ mod tests {
 
     /// Write a Y4M holding one frame with the given luma; chroma is flat.
     fn write(path: &Path, w: usize, h: usize, luma: &[u8]) {
+        write_at(path, w, h, "30:1", luma);
+    }
+
+    fn write_at(path: &Path, w: usize, h: usize, rate: &str, luma: &[u8]) {
         let mut f = File::create(path).unwrap();
-        write!(f, "YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\n").unwrap();
+        write!(f, "YUV4MPEG2 W{w} H{h} F{rate} Ip A1:1 C420jpeg\n").unwrap();
         f.write_all(b"FRAME\n").unwrap();
         f.write_all(luma).unwrap();
         f.write_all(&vec![128u8; 2 * (w / 2) * (h / 2)]).unwrap();
@@ -517,6 +574,112 @@ mod tests {
         for p in [&a, &on_edge, &on_flat] {
             std::fs::remove_file(p).ok();
         }
+    }
+
+    /// The millisecond column has to follow the file, not a constant. At 15 fps
+    /// a settling time is twice the milliseconds it is at 30, and the old
+    /// hard-coded thirty would have printed the same number for both.
+    #[test]
+    fn milliseconds_come_from_the_rate_in_the_header() {
+        let d = dir();
+        let (w, h) = (16usize, 8usize);
+        let luma = striped(w, h);
+
+        let mut seen = Vec::new();
+        for rate in ["30:1", "15:1"] {
+            let (a, b) = (d.join("r-a.y4m"), d.join("r-b.y4m"));
+            write_at(&a, w, h, rate, &luma);
+            write_at(&b, w, h, rate, &luma);
+            let r = compare(&a, &b).unwrap();
+            // One undamaged frame settles immediately, so the interesting part
+            // is the rate the report carries and prints.
+            let text = r.render_settle(2, 1);
+            seen.push((r.fps, text));
+            std::fs::remove_file(&a).ok();
+            std::fs::remove_file(&b).ok();
+        }
+
+        assert_eq!(seen[0].0, 30.0);
+        assert_eq!(seen[1].0, 15.0);
+        assert!(seen[0].1.contains("30 к/с"), "{}", seen[0].1);
+        assert!(seen[1].1.contains("15 к/с"), "{}", seen[1].1);
+    }
+
+    /// The same settle, in frames, is twice as many milliseconds at half the
+    /// rate. Built by hand rather than through `compare`, because a
+    /// self-comparison settles in zero frames and zero milliseconds is the one
+    /// value that cannot tell the two rates apart.
+    #[test]
+    fn the_same_frame_count_is_more_milliseconds_at_a_lower_rate() {
+        let bad = 0.9;
+        let good = 0.1;
+        // Cycle of 10, four scrolling: the hold recovers on its third frame.
+        let series = vec![bad, bad, bad, bad, bad, bad, good, good, good, good];
+
+        let at = |fps: f64| Report {
+            frames: series.len() as u64,
+            width: 16,
+            height: 8,
+            edge_share: 0.5,
+            edge_p50: [0.0; DAMAGE.len()],
+            edge_p95: [0.0; DAMAGE.len()],
+            all_p95: 0.0,
+            mae: 0.0,
+            fps,
+            series: series.clone(),
+        }
+        .render_settle(10, 4);
+
+        assert!(at(30.0).contains("через 2 кадр(ов), 67 мс"), "{}", at(30.0));
+        assert!(at(15.0).contains("через 2 кадр(ов), 133 мс"), "{}", at(15.0));
+    }
+
+    #[test]
+    fn a_file_with_no_rate_is_refused_rather_than_assumed_to_be_thirty() {
+        let d = dir();
+        let path = d.join("norate.y4m");
+        let (w, h) = (16usize, 8usize);
+        let mut f = File::create(&path).unwrap();
+        write!(f, "YUV4MPEG2 W{w} H{h} Ip A1:1 C420jpeg\n").unwrap();
+        f.write_all(b"FRAME\n").unwrap();
+        f.write_all(&striped(w, h)).unwrap();
+        f.write_all(&vec![128u8; 2 * (w / 2) * (h / 2)]).unwrap();
+        drop(f);
+
+        let err = compare(&path, &path).unwrap_err();
+        assert!(err.contains("частоту кадров"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn two_recordings_at_different_rates_are_refused() {
+        let d = dir();
+        let (a, b) = (d.join("m-a.y4m"), d.join("m-b.y4m"));
+        let (w, h) = (16usize, 8usize);
+        let luma = striped(w, h);
+        write_at(&a, w, h, "30:1", &luma);
+        write_at(&b, w, h, "15:1", &luma);
+
+        let err = compare(&a, &b).unwrap_err();
+        assert!(err.contains("разной частоты"), "{err}");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// ffmpeg is free to hand back a ratio that is not over one.
+    #[test]
+    fn a_non_integer_rate_is_divided_rather_than_misread() {
+        let d = dir();
+        let (a, b) = (d.join("ntsc-a.y4m"), d.join("ntsc-b.y4m"));
+        let (w, h) = (16usize, 8usize);
+        let luma = striped(w, h);
+        write_at(&a, w, h, "30000:1001", &luma);
+        write_at(&b, w, h, "30000:1001", &luma);
+
+        let r = compare(&a, &b).unwrap();
+        assert!((r.fps - 29.97).abs() < 0.01, "{}", r.fps);
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 
     #[test]
