@@ -141,6 +141,17 @@ impl Readback {
         })
     }
 
+    /// The spelling the operator typed, for messages that name the mode back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Readback::Off => "off",
+            Readback::Full => "full",
+            Readback::Dirty => "dirty",
+            Readback::Compare => "compare",
+            Readback::Buffered => "buffered",
+        }
+    }
+
     pub fn wants_pixels(self) -> bool {
         self != Readback::Off
     }
@@ -206,6 +217,27 @@ pub trait FrameSource {
     fn describe(&self) -> String;
 
     fn dimensions(&self) -> (u32, u32);
+
+    /// Whether this source really implements a readback mode.
+    ///
+    /// Not every source can. [`Readback::Buffered`] is a claim about GPU
+    /// staging textures — frame `i` starts a copy and reads the one the GPU had
+    /// a whole frame to fill — and a source that composes its frames in system
+    /// memory has no such thing. Both reproducible sources accepted the flag
+    /// and ignored it, so the mode measured the ordinary path while the report
+    /// printed «пиксели на кадр старше» beside the result, and the README sent
+    /// the operator to exactly those sources to try it.
+    ///
+    /// The answer is a refusal rather than a simulated one-frame lag. Faking it
+    /// would manufacture a figure that reads as a measurement of the GPU bus
+    /// and is not one, which is a worse outcome than not being able to measure
+    /// it here at all.
+    ///
+    /// Default: everything except `Buffered`, which is the honest answer for
+    /// any source that does not own a GPU staging texture.
+    fn supports(&self, readback: Readback) -> bool {
+        readback != Readback::Buffered
+    }
 
     /// Wait up to `timeout` for a frame.
     ///

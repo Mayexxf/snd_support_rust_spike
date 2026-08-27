@@ -1606,6 +1606,24 @@ fn main() {
         }
     };
 
+    // Refused rather than silently ignored. `--readback buffered` on a source
+    // with no GPU staging texture measured the ordinary path while the report
+    // printed «пиксели на кадр старше» next to the result — a sentence about
+    // hardware that was not involved.
+    if !source.supports(args.readback) {
+        eprintln!(
+            "\nОшибка: источник «{}» не реализует --readback {}.\n\
+             Буферизованное чтение — это две промежуточные текстуры на видеокарте:\n\
+             кадр i начинает копирование в одну и читает вторую, которую видеоядро\n\
+             заполняло целый кадр. У источника, собирающего кадры в обычной памяти,\n\
+             такого нет, и он молча мерил бы обычный путь.\n\
+             Этот режим меряется только на живом захвате: --source dda",
+            source.describe(),
+            args.readback.name()
+        );
+        std::process::exit(2);
+    }
+
     let _timer = timer::Resolution::raise();
 
     let (w, h) = source.dimensions();

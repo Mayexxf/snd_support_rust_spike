@@ -700,6 +700,12 @@ fn clamp(r: Rect, width: u32, height: u32) -> Rect {
 }
 
 impl FrameSource for DdaSource {
+    /// The one source that really has two staging textures, so the one source
+    /// for which [`Readback::Buffered`] means what the report says it means.
+    fn supports(&self, _readback: Readback) -> bool {
+        true
+    }
+
     fn describe(&self) -> String {
         format!(
             "DXGI Desktop Duplication, {}×{}, адаптер «{}»",
