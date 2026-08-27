@@ -103,8 +103,8 @@ function Get-RealisedConfig([string]$file) {
 # Возвращает массив строк для передачи ffmpeg. Оговорки печатаются: то, что
 # сопоставить нельзя, не повод молчать об этом -- это и есть блок оговорок,
 # который обязана нести таблица.
-function Get-PlanArgs([string]$target, [int]$kbps) {
-  $out = & $SweepBin --plan $target --bitrate $kbps --encode vp9 2>&1 | Out-String
+function Get-PlanArgs([string]$target, [int]$kbps, [int]$maxq = 63) {
+  $out = & $SweepBin --plan $target --bitrate $kbps --max-q $maxq --encode vp9 2>&1 | Out-String
   $lines = $out -split "`r?`n"
   $argv = $null
   foreach ($l in $lines) {
@@ -159,4 +159,25 @@ function Test-RowIsComparable([string]$tag, [string]$file, [int]$expectedGop, [i
     Write-Host "  $tag : I=$($c.keyframes) P=$($c.p_frames) B=$($c.b_frames) has_b=$($c.has_b) reorder=$($c.reorder)"
   }
   return $ok
+}
+
+# Попал ли кодер в заданный битрейт.
+#
+# Сравнение идёт при РАВНОМ ДОСТИГНУТОМ битрейте, поэтому строка, промахнувшаяся
+# в разы, несравнима, каким бы правильным ни был её поток. Заслон по структуре
+# этого не ловит: первая пересъёмка пропустила libx264, выдавший 10305 кбит/с при
+# целях 1000, 2000 и 4000 -- одно и то же число до единицы, то есть рейт-контроль
+# не работал вовсе, а поток был безупречен. И h264_qsv с 58 кбит/с при цели 1000.
+#
+# Границы взяты из первого удачного захода (rd3): промах больше четверти вниз или
+# трети вверх -- не точка.
+function Test-HitBitrate([string]$tag, [int]$target, [double]$got) {
+  if ($target -le 0) { return $false }
+  $ratio = $got / $target
+  if ($ratio -lt 0.75 -or $ratio -gt 1.35) {
+    Write-Host ("  ОТКАЗ {0} : {1} кбит/с при цели {2} — промах в {3:N1} раза" -f `
+      $tag, [int]$got, $target, [math]::Max($ratio, 1 / $ratio))
+    return $false
+  }
+  return $true
 }

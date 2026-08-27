@@ -18,6 +18,24 @@
 $N = 300
 $STEP = 61
 $KBPS = 1000, 2000, 4000
+
+# Потолок квантователя снят у ВСЕХ, включая нас, и это методическое решение.
+#
+# Первая пересъёмка шла с нашим умолчанием 56, перенесённым на остальных как 45
+# по шкале H.26x. Результат: libx264 выдал 10305 кбит/с при целях 1000, 2000 и
+# 4000 -- одно и то же число до единицы; libvpx 5429/5831/6942; наш кодер
+# 8187/8442/6818, где 4000 даёт МЕНЬШЕ битов, чем 1000. Упёршись в потолок,
+# рейт-контроль теряет единственный рычаг, и целевой битрейт перестаёт на
+# что-либо влиять. Сравнивать при равном достигнутом битрейте становится нечего:
+# ничего не равно.
+#
+# 63 по шкале VPx это 51 по H.26x, то есть собственный максимум и той и другой
+# шкалы. Значит ключ передаётся, но никого не ограничивает, и каждый кодер
+# распоряжается качеством сам -- ровно то, что нужно для сравнения по каналу.
+#
+# Наш потолок 56 остаётся свойством НАШЕЙ настройки и меряется отдельно, а не
+# навязывается всем как условие сравнения.
+$MAXQ = 63
 $out = Join-Path $SweepWork "table-results.csv"
 $src = Join-Path $SweepWork "table-src.y4m"
 $dec = Join-Path $SweepWork "table-dec.y4m"
@@ -30,19 +48,22 @@ Write-Host "готовлю исходник: $N кадров, шаг $STEP …"
   Select-String "отпечаток|период|опрошено"
 if (-not (Test-Path $src)) { throw "не удалось подготовить $src" }
 
-$plan = & $SweepBin --plan libvpx-vp9 --bitrate 2000 --encode vp9 2>&1 | Out-String
+$plan = & $SweepBin --plan libvpx-vp9 --bitrate 2000 --max-q 63 --encode vp9 2>&1 | Out-String
 $gop = if ($plan -match "-g (\d+)") { [int]$Matches[1] } else { throw "в плане нет -g" }
 Write-Host "интервал ключевых кадров: $gop`n"
 
 function Add-Row([string]$name, [int]$kbps, [string]$file) {
-  if (-not (Test-RowIsComparable $name $file $gop $N)) {
-    "$name,$kbps,-,-,-,-,ОТКАЗ,ОТКАЗ,ОТКАЗ" | Out-File -FilePath $out -Append -Encoding utf8
+  $got = [math]::Round((Get-Item $file).Length / $N * 8 * 30 / 1000, 0)
+  $structural = Test-RowIsComparable $name $file $gop $N
+  $hit = Test-HitBitrate $name $kbps $got
+  if (-not ($structural -and $hit)) {
+    "$name,$kbps,$got,-,-,-,ОТКАЗ,ОТКАЗ,ОТКАЗ" | Out-File -FilePath $out -Append -Encoding utf8
     return
   }
   $c = Get-RealisedConfig $file
-  $got = [math]::Round((Get-Item $file).Length / $N * 8 * 30 / 1000, 0)
 
-  $sr = & $SweepFfmpeg -hide_banner -i $file -i $src -lavfi "[0:v][1:v]ssim" -f null - 2>&1 | Out-String
+  $sr = & $SweepFfmpeg -hide_banner -i $file -i $src -lavfi "[0:v][1:v]ssim" -f null - 2>&1 |
+    Out-String
   $ss = if ($sr -match "All:([0-9.]+)") { $Matches[1] } else { "?" }
 
   Remove-Item $dec -ErrorAction SilentlyContinue
@@ -67,7 +88,7 @@ function Add-Row([string]$name, [int]$kbps, [string]$file) {
 foreach ($k in $KBPS) {
   Write-Host "=== $k кбит/с"
   foreach ($t in @(@("libx264","mp4"), @("h264_qsv","mp4"), @("hevc_qsv","mp4"), @("libvpx-vp9","webm"))) {
-    $opts = Get-PlanArgs $t[0] $k
+    $opts = Get-PlanArgs $t[0] $k $MAXQ
     $f = Join-Path $SweepWork "tb-$($t[0] -replace '[^a-z0-9]','_')-$k.$($t[1])"
     & $SweepFfmpeg @(@("-hide_banner","-y","-i",$src) + $opts + @($f)) 2>&1 | Out-Null
     if (Test-Path $f) { Add-Row $t[0] $k $f; Remove-Item $f -ErrorAction SilentlyContinue }
@@ -77,7 +98,7 @@ foreach ($k in $KBPS) {
   # Наш кодер -- своим битстримом, на тех же кадрах.
   $f = Join-Path $SweepWork "tb-ours-$k.ivf"
   & $SweepBin --source "image:$SweepShot" --motion scroll --step $STEP --frames $N `
-    --encode vp9 --bitrate $k --emit-ivf $f 2>&1 | Out-Null
+    --encode vp9 --max-q $MAXQ --bitrate $k --emit-ivf $f 2>&1 | Out-Null
   if (Test-Path $f) { Add-Row "ours-vp9" $k $f; Remove-Item $f -ErrorAction SilentlyContinue }
 }
 
