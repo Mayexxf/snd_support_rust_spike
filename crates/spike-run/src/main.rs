@@ -27,6 +27,10 @@ mod yuv;
 /// one alone settles nothing.
 mod ivf;
 
+/// How much of the text survived. Reads two Y4M files and needs no codec, so
+/// it scores anything ffmpeg can decode — ours and everyone else's alike.
+mod quality;
+
 use spike_capture::image::{ImageSource, Scenario};
 use spike_capture::shot::Shot;
 use spike_capture::{CaptureError, Dirty, FrameSource, Readback, Rect, image, synthetic};
@@ -128,6 +132,8 @@ struct Args {
     export: Option<PathBuf>,
     /// Encode with this run's own settings, write the bitstream, and stop.
     emit: Option<PathBuf>,
+    /// Score one decoded sequence against the source it came from, and stop.
+    quality: Option<(PathBuf, PathBuf)>,
     /// Scroll step for a screenshot source, in pixels per frame.
     step: u32,
     fps: u32,
@@ -174,6 +180,7 @@ impl Default for Args {
             drop_frame: None,
             export: None,
             emit: None,
+            quality: None,
             step: image::DEFAULT_STEP,
             fps: DEFAULT_FPS,
             width: 1920,
@@ -443,6 +450,13 @@ fn usage() -> &'static str {
                                        отдаёт наш кодек чужой мерке. Пока нет
                                        обоих, сравнивать не с чем.
                                        Только с воспроизводимым источником
+    --quality <исходник> <проверяемый>  оценить, сколько текста уцелело. Оба
+                                       файла — Y4M одного размера. Считается
+                                       доля КРАЕВЫХ пикселей исходника, которые
+                                       кодер сдвинул дальше порога: фон
+                                       воспроизводят все, а разборчивость живёт
+                                       на штрихах. Кодек тут ни при чём — годится
+                                       всё, что ffmpeg умеет декодировать
     --drop-frame <N>                   не отдать декодеру кадр N. Только с --dump:
                                        показывает, что видит получатель после
                                        потерянного пакета и надолго ли
@@ -510,6 +524,11 @@ fn parse_args() -> Result<Args, String> {
             "--dump" => args.dump = Some(PathBuf::from(value()?)),
             "--export-yuv" => args.export = Some(PathBuf::from(value()?)),
             "--emit-ivf" => args.emit = Some(PathBuf::from(value()?)),
+            "--quality" => {
+                let src = PathBuf::from(value()?);
+                let test = PathBuf::from(value()?);
+                args.quality = Some((src, test));
+            }
             "--drop-frame" => {
                 let n: u64 = value()?.parse().map_err(|_| "--drop-frame ждёт число")?;
                 args.drop_frame = Some(n);
@@ -1312,6 +1331,17 @@ fn main() {
         if let Err(e) = export(&args, &path) {
             eprintln!("\nОшибка: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some((src, test)) = args.quality.clone() {
+        match quality::compare(&src, &test) {
+            Ok(report) => print!("{}", report.render()),
+            Err(e) => {
+                eprintln!("\nОшибка: {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
