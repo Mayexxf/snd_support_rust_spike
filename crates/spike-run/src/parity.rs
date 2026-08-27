@@ -128,6 +128,35 @@ pub fn plan(settings: &Settings, target: Target) -> Plan {
     argv.push(s("-bufsize"));
     argv.push(format!("{bufsize_kbit}k"));
 
+    // QSV's rate control needs about a megabit of buffer in absolute terms, and
+    // collapses below it. Measured at 1080p, 120 frames, target 1000 kbit/s
+    // with -bf 0:
+    //
+    //   -bufsize 250k    85 kbit/s, and 151 frames out of 120 — corrupt
+    //   -bufsize 500k   112 kbit/s
+    //   -bufsize 1000k 1143 kbit/s — works
+    //   -bufsize 2000k 1124 kbit/s — works
+    //
+    // Not a duration threshold: at a target of 2000 the same 500 ms comes to
+    // 1000 kbit and works fine. It is the absolute size. hevc_qsv at a target
+    // of 500 produced no frames at all.
+    //
+    // Warned rather than silently raised. Enlarging the buffer for QSV alone
+    // would hand it a rate controller our own encoder does not have, which is
+    // the very kind of quiet asymmetry this module exists to end.
+    if matches!(target, Target::H264Qsv | Target::HevcQsv) && bufsize_kbit < 1000 {
+        unmatched.push(Unmatched {
+            knob: "rc_buf_ms",
+            why: format!(
+                "буфер {bufsize_kbit} кбит: у QSV ниже примерно 1000 кбит рейт-контроль \
+                 разваливается — при цели 1000 и буфере 500 кбит выходит 112 кбит/с, \
+                 а при 1000 кбит буфера 1143. Строка на этом битрейте будет отклонена \
+                 по промаху, и это правильно: поднять буфер только у QSV значило бы \
+                 дать ему рейт-контроль, которого нет у нас"
+            ),
+        });
+    }
+
     // Keyframe interval, from the same field the encoder is given.
     argv.push(s("-g"));
     argv.push(s(settings.kf_max_dist()));
