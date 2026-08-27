@@ -938,6 +938,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
 /// by frame number, so a second pass encodes the same planes with the same
 /// settings and produces the same bytes. The fingerprint printed at the end is
 /// how that claim is checked rather than believed.
+#[cfg(feature = "vpx")]
 fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let Some(fourcc) = args.codec.fourcc() else {
         return Err("нечего писать: кодек не выбран. Добавьте --encode vp9".to_owned());
@@ -1134,6 +1135,21 @@ fn unpaced(args: &Args) -> Args {
     let mut out = args.clone();
     out.frames = Some(args.frames.unwrap_or(300).max(1));
     out
+}
+
+/// Without libvpx there is no encoder to emit a bitstream from, and — since the
+/// pass now decodes what it wrote — no decoder to check it with either.
+///
+/// A separate stub rather than a `cfg` block inside the function: the shape the
+/// rest of this file already uses for `build_encoder`, `encode_one` and
+/// `print_plan`, and the reason it is worth the duplication is that the
+/// alternative compiles on one configuration and not the other, which is
+/// exactly what happened here.
+#[cfg(not(feature = "vpx"))]
+fn emit_bitstream(_args: &Args, _path: &Path) -> Result<(), String> {
+    Err("стенд собран без libvpx: битстрим брать неоткуда.\n\
+         Пересоберите с --features vpx (см. README)"
+        .to_owned())
 }
 
 /// Print ffmpeg's arguments for one target, from our own encoder's settings.
