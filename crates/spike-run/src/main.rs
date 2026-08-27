@@ -108,6 +108,7 @@ mod timer {
     }
 }
 
+#[derive(Clone)]
 struct Args {
     source: String,
     /// Kept as text: the synthetic desktop and a real screenshot understand
@@ -704,7 +705,7 @@ fn build_source(args: &Args) -> Result<Box<dyn FrameSource>, String> {
 /// machine would only hide how fast it is.
 fn build_image(args: &Args, path: &Path) -> Result<Box<dyn FrameSource>, String> {
     let scenario = Scenario::parse(&args.motion).ok_or(format!(
-        "снимок не знает сценария «{}». Есть still, caret, edit, scroll, drag",
+        "снимок не знает сценария «{}». Есть still, caret, edit, scroll, drag, settle",
         args.motion
     ))?;
     let interval = args
@@ -804,6 +805,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
         ));
     }
 
+    let args = &unpaced(args);
     let mut source = build_source(args)?;
     let (w, h) = source.dimensions();
     let mut plane = I420::new(w, h, args.scale);
@@ -820,6 +822,7 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
 
     let mut writer = yuv::Writer::create(path, layout, plane.width, plane.height, args.fps)?;
     let mut done = 0u64;
+    let mut have = false;
     let deadline = Instant::now() + Duration::from_secs(300);
 
     while done < want && Instant::now() < deadline {
@@ -832,13 +835,26 @@ fn export(args: &Args, path: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(e.to_string()),
         };
-        let Some((fw, fh, stride, bgra)) = grabbed else { continue };
 
-        // Whole-frame conversion, not the dirty regions: the file has to hold a
-        // complete picture per frame however little of it moved. The measured
-        // path converts only what changed, which is right there and wrong here.
-        let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
-        plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+        match grabbed {
+            Some((fw, fh, stride, bgra)) => {
+                // Whole-frame conversion, not the dirty regions: the file has to
+                // hold a complete picture per frame however little of it moved.
+                // The measured path converts only what changed, which is right
+                // there and wrong here.
+                let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
+                plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+                have = true;
+            }
+            // The screen did not change. That is a frame on the timeline, not a
+            // gap in it, and skipping it is how the `settle` scenario came out
+            // byte-identical to `scroll`: the still frames vanished and what was
+            // left was one unbroken scroll. Every scenario with quiet frames was
+            // silently having its time compressed the same way.
+            None if have => {}
+            None => continue,
+        }
+
         writer.frame(&plane)?;
         done += 1;
     }
@@ -899,6 +915,7 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
         ));
     }
 
+    let args = &unpaced(args);
     let mut source = build_source(args)?;
     let (w, h) = source.dimensions();
     let mut plane = I420::new(w, h, args.scale);
@@ -922,6 +939,7 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     let mut payload: Vec<u8> = Vec::new();
     let mut done = 0u64;
     let mut keyframes = 0u64;
+    let mut have = false;
     let deadline = Instant::now() + Duration::from_secs(600);
 
     while done < want && Instant::now() < deadline {
@@ -934,13 +952,22 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(e.to_string()),
         };
-        let Some((fw, fh, stride, bgra)) = grabbed else { continue };
-
-        // Whole frame, exactly as in `export` and for the same reason: the
-        // encoder must be handed a complete picture, not the dirty regions the
-        // measured path converts.
-        let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
-        plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+        match grabbed {
+            Some((fw, fh, stride, bgra)) => {
+                // Whole frame, exactly as in `export` and for the same reason:
+                // the encoder must be handed a complete picture, not the dirty
+                // regions the measured path converts.
+                let whole = Rect { left: 0, top: 0, right: fw as i32, bottom: fh as i32 };
+                plane.convert_bgra(&bgra, stride, std::slice::from_ref(&whole));
+                have = true;
+            }
+            // A quiet screen is a frame the encoder still gets, and it has to
+            // get it here or the question this file exists to answer cannot be
+            // asked: whether the picture improves while nothing moves. Skipping
+            // these made `settle` produce the very same bytes as `scroll`.
+            None if have => {}
+            None => continue,
+        }
 
         payload.clear();
         let out = encode_one_keeping(&mut encoder, &plane, &mut payload)?;
@@ -992,6 +1019,19 @@ fn emit_bitstream(args: &Args, path: &Path) -> Result<(), String> {
     println!("что и чужие кодеки, декодируйте файл и сравните с --export-yuv тех же");
     println!("кадров: содержимое совпадёт до байта, а разойдётся только качество.");
     Ok(())
+}
+
+/// The same run with pacing turned off.
+///
+/// An export has no reason to run in real time, and with pacing on a `None`
+/// from the source means either "the screen did not change" or "not due yet" —
+/// two things these loops must tell apart, because one is a frame to write and
+/// the other is not. Forcing the frame count settles it: [`build_image`] only
+/// paces when no count was given.
+fn unpaced(args: &Args) -> Args {
+    let mut out = args.clone();
+    out.frames = Some(args.frames.unwrap_or(300).max(1));
+    out
 }
 
 fn grab(args: &Args, path: &Path) -> Result<(), String> {

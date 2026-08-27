@@ -736,6 +736,43 @@ mod tests {
         }
     }
 
+    /// The trap this scenario fell into on the day it was written, stated as a
+    /// test so it cannot be fallen into again.
+    ///
+    /// A quiet frame is reported as `None`, and a consumer that reads that as
+    /// "nothing yet, ask again" gets back exactly the moving frames — which are
+    /// `scroll`, frame for frame and byte for byte. The export path did this,
+    /// and `settle` produced a file with the same fingerprint as `scroll` while
+    /// every settling number computed from it looked plausible.
+    ///
+    /// Anything building a timeline out of this source has to count the quiet
+    /// frames rather than wait through them.
+    #[test]
+    fn dropping_the_quiet_frames_turns_settle_back_into_scroll() {
+        let moving: Vec<Vec<u8>> = frames(Scenario::Settle, (SETTLE_CYCLE * 2) as usize)
+            .into_iter()
+            .flatten()
+            .map(|(_, px)| px)
+            .collect();
+        assert!(!moving.is_empty(), "хоть что-то должно было двигаться");
+
+        let scrolled: Vec<Vec<u8>> = frames(Scenario::Scroll, moving.len())
+            .into_iter()
+            .flatten()
+            .map(|(_, px)| px)
+            .collect();
+
+        assert_eq!(
+            moving.len(),
+            scrolled.len(),
+            "движущихся кадров у settle столько же, сколько всех у scroll"
+        );
+        assert_eq!(
+            moving, scrolled,
+            "выброси тихие кадры — и settle это ровно scroll, до байта"
+        );
+    }
+
     #[test]
     fn scenarios_parse_and_unknown_ones_do_not() {
         assert_eq!(Scenario::parse("scroll"), Some(Scenario::Scroll));
